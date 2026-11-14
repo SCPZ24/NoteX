@@ -8,6 +8,7 @@ Creates and removes only its own random database and database account.
 """
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -112,7 +113,7 @@ def main():
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = "Bearer " + token
-        body = None if data is None else json.dumps(data).encode()
+        body = None if data is None else json.dumps(data, ensure_ascii=False).encode()
         req = urllib.request.Request(base + path, data=body, headers=headers, method=method)
         try:
             response = urllib.request.urlopen(req, timeout=8)
@@ -151,6 +152,7 @@ def main():
         sql(f"CREATE DATABASE `{database}`;", False)
         database_created = True
         sql((ROOT / "migrations/0001_accounts_follow.sql").read_text())
+        sql((ROOT / "migrations/0002_posts.sql").read_text())
         sql(f"CREATE USER '{database}'@'127.0.0.1' IDENTIFIED BY '{db_password}';", False)
         account_created = True
         sql(f"GRANT SELECT, INSERT, UPDATE, DELETE ON `{database}`.* TO '{database}'@'127.0.0.1';", False)
@@ -183,6 +185,96 @@ def main():
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         check(sql(f"SELECT COUNT(*) FROM sessions WHERE token_hash=UNHEX('{token_hash}') AND user_id={actor};") == "1", "stored token digest")
         passed("login, token digest, authentication and exact username lookup")
+
+        post_path = api + "/posts"
+        author_posts = api + f"/users/{actor}/posts"
+        for method, path in [("POST", post_path), ("GET", post_path + "/1"),
+                             ("DELETE", post_path + "/1"), ("GET", author_posts)]:
+            request(method, path, status=401, code="unauthorized")
+        created = request("POST", post_path, token,
+                          data={"content": " \n中文正文 🐈\t ", "author_id": users[1]["id"]}, status=201)
+        check(created["content"] == "中文正文 🐈", "trimmed post content")
+        check(created["author"] == {"id": actor, "username": "alice"}, "authenticated post author")
+        check(created["id"] > 0 and created["created_on"] > 0, "post identity and timestamp")
+        check(request("GET", post_path + f"/{created['id']}", tokens[1]) == created, "public post detail")
+        for content in ["", " \t\n\u3000 ", "x" * 501, "🐈" * 501]:
+            request("POST", post_path, token, data={"content": content}, status=400, code="invalid_input")
+        request("POST", post_path, token, data={}, status=400, code="invalid_input")
+        unicode_post = request("POST", post_path, tokens[1], data={"content": "🐈" * 500}, status=201)
+        check(request("GET", post_path + f"/{unicode_post['id']}", token) == unicode_post,
+              "500 Unicode code points round trip")
+        request("DELETE", post_path + f"/{created['id']}", tokens[1], status=403, code="forbidden")
+        check(request("GET", post_path + f"/{created['id']}", token) == created, "forbidden deletion preserves post")
+        for method in ["GET", "DELETE"]:
+            request(method, post_path + "/999999999", token, status=404, code="post_not_found")
+            for value in ["0", "-1", "bad", "9223372036854775808"]:
+                request(method, post_path + "/" + value, token, status=400, code="invalid_input")
+        passed("post authentication, author identity, Unicode validation and public detail")
+
+        deleted_path = post_path + f"/{created['id']}"
+        check(request("DELETE", deleted_path, token) == {"status": "ok"}, "delete response")
+        deletion = sql(f"SELECT deleted_on FROM posts WHERE id={created['id']};")
+        check(deletion != "NULL", "durable deletion marker")
+        # A fixed old value makes timestamp rewrites detectable even within one second.
+        sql(f"UPDATE posts SET deleted_on=1000 WHERE id={created['id']};")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda _: request("DELETE", deleted_path, token), range(16)))
+        check(sql(f"SELECT deleted_on FROM posts WHERE id={created['id']};") == "1000",
+              "repeated deletion preserves timestamp")
+        check(sql(f"SELECT created_on FROM posts WHERE id={created['id']};") == str(created["created_on"]),
+              "deletion preserves publication time")
+        request("GET", deleted_path, token, status=404, code="post_not_found")
+        request("DELETE", deleted_path, tokens[1], status=403, code="forbidden")
+        check(request("GET", author_posts, token) == {"items": [], "next_cursor": "", "has_more": False},
+              "deleted posts excluded from empty author list")
+        passed("author-only soft deletion, concurrent repeated deletion and read filtering")
+
+        published = []
+        for i in range(23):
+            item = request("POST", post_path, token, data={"content": f"post {i}"}, status=201)
+            published.append(item)
+            sql(f"UPDATE posts SET created_on={1000 + i // 3} WHERE id={item['id']};")
+        expected_posts = [item["id"] for item in reversed(published)]
+        default_page = request("GET", author_posts, tokens[1])
+        check(len(default_page["items"]) == 20 and default_page["has_more"], "default post page size")
+        check(request("GET", author_posts + "?limit=", token) == default_page, "empty limit default")
+        all_posts = request("GET", author_posts + "?limit=100", token)
+        check([item["id"] for item in all_posts["items"]] == expected_posts, "author membership and ordering")
+
+        def post_page(cursor=""):
+            query = urllib.parse.urlencode({"limit": 2, "cursor": cursor})
+            return request("GET", author_posts + "?" + query, tokens[1])
+
+        seen_posts, seen_cursors, after = [], set(), ""
+        for _ in range(20):
+            result = post_page(after)
+            check(len(result["items"]) <= 2, "post page limit")
+            seen_posts.extend(item["id"] for item in result["items"])
+            if not result["has_more"]:
+                check(result["next_cursor"] == "", "terminal post cursor")
+                break
+            after = result["next_cursor"]
+            check(after and after not in seen_cursors, "post cursor progress")
+            seen_cursors.add(after)
+        check(seen_posts == expected_posts, "complete post pagination without duplicates")
+        first_posts = post_page()
+        post_cursor = first_posts["next_cursor"]
+        request("GET", api + f"/users/{users[1]['id']}/posts?cursor={post_cursor}", token,
+                status=400, code="invalid_cursor")
+        request("GET", api + f"/users/{actor}/following?cursor={post_cursor}", token,
+                status=400, code="invalid_cursor")
+        for cursor_value in ["invalid!", "a" * 513]:
+            request("GET", author_posts + "?cursor=" + cursor_value, token, status=400, code="invalid_cursor")
+        for value in ["0", "101", "-1", "abc"]:
+            request("GET", author_posts + "?limit=" + value, token, status=400, code="invalid_input")
+        request("GET", api + "/users/999999999/posts", token, status=404, code="user_not_found")
+        request("GET", api + "/users/0/posts", token, status=400, code="invalid_input")
+        request("DELETE", post_path + f"/{first_posts['items'][-1]['id']}", token)
+        new_post = request("POST", post_path, token, data={"content": "new after page one"}, status=201)
+        check([item["id"] for item in post_page(post_cursor)["items"]] == expected_posts[2:4],
+              "post continuation after boundary deletion and new publication")
+        check(post_page()["items"][0]["id"] == new_post["id"], "refresh includes new post")
+        passed("author post pagination, tied timestamps, cursor scope and changes between pages")
 
         def relation(target):
             return api + f"/users/{target}/follow"
@@ -243,9 +335,13 @@ def main():
             check(all(i["created_on"] == 1003 for i in items), "relationship timestamps")
         check(page("following", owner=users[1]["id"])["items"] == [], "empty JSON array")
         check(len(page("following", limit=100)["items"]) == 5, "maximum page size")
+        for direction in ["following", "followers"]:
+            check(request("GET", api + f"/users/{actor}/{direction}?limit=", token) == page(direction, limit=100),
+                  "empty relationship limit uses default")
         passed("asymmetric directions, tied timestamps, exact page boundary and empty list")
         first = page("following")
         cursor = first["next_cursor"]
+        request("GET", author_posts + "?cursor=" + cursor, token, status=400, code="invalid_cursor")
         for path in [f"/users/{actor}/followers?cursor={cursor}",
                      f"/users/{target}/following?cursor={cursor}",
                      f"/users/{actor}/following?cursor=invalid!",
@@ -271,10 +367,126 @@ def main():
         reverse = page("followers", limit=100, owner=target)
         check((actor in [i["user_id"] for i in reverse["items"]]) == bool(state), "reverse matches state")
         passed("mixed concurrent follow/unfollow converges in both directions")
+
+        # Independent Feed fixture. Expected results come from the posts created
+        # here and explicit author sets, without reusing the API's SQL query.
+        feed_users, feed_tokens = [], []
+        for name in ["feed_reader", "feed_writer_one", "feed_writer_two", "feed_outsider"]:
+            feed_users.append(request("POST", api + "/register",
+                                      data={"username": name, "password": password}, status=201))
+            feed_tokens.append(request("POST", api + "/login",
+                                       data={"username": name, "password": password})["token"])
+        reader = feed_users[0]["id"]
+        feed_path = api + "/feed"
+        request("GET", feed_path, status=401, code="unauthorized")
+        empty_feed = {"items": [], "next_cursor": "", "has_more": False}
+        check(request("GET", feed_path, feed_tokens[0]) == empty_feed, "empty Feed")
+
+        def publish_feed(index, content, timestamp):
+            item = request("POST", post_path, feed_tokens[index], data={"content": content}, status=201)
+            sql(f"UPDATE posts SET created_on={timestamp} WHERE id={item['id']};")
+            item["created_on"] = timestamp
+            return item
+
+        feed_posts = []
+        for i in range(34):
+            author_index = 1 if i < 25 else 2 if i < 30 else 0
+            feed_posts.append(publish_feed(author_index, f"Feed fixture {i}", 1000 + (i * 7) % 11))
+        for i in range(22):
+            publish_feed(3, f"unfollowed newer post {i}", 3000 + i)
+            removed = publish_feed(2, f"deleted newer post {i}", 2000 + i)
+            request("DELETE", post_path + f"/{removed['id']}", feed_tokens[2])
+
+        def expected_feed(authors):
+            return sorted((p for p in feed_posts if p["author"]["id"] in authors),
+                          key=lambda p: (p["created_on"], p["id"]), reverse=True)
+
+        def feed_page(cursor="", limit=3, reader_token=feed_tokens[0]):
+            query = urllib.parse.urlencode({"limit": limit, "cursor": cursor})
+            return request("GET", feed_path + "?" + query, reader_token)
+
+        def collect_feed():
+            items, after, seen = [], "", set()
+            for _ in range(100):
+                result = feed_page(after)
+                check(len(result["items"]) <= 3, "Feed page size")
+                items.extend(result["items"])
+                if not result["has_more"]:
+                    check(result["next_cursor"] == "", "terminal Feed cursor")
+                    return items
+                after = result["next_cursor"]
+                check(after and after not in seen, "Feed cursor progress")
+                seen.add(after)
+            raise AssertionError("Feed pagination did not terminate")
+
+        check(collect_feed() == expected_feed({reader}), "self posts without following anyone")
+        # A follower's posts must not leak into the reader's Feed.
+        request("PUT", relation(reader), feed_tokens[3])
+        check(collect_feed() == expected_feed({reader}), "incoming follows do not add authors")
+        request("PUT", relation(feed_users[1]["id"]), feed_tokens[0])
+        check(collect_feed() == expected_feed({reader, feed_users[1]["id"]}),
+              "new follow includes author history beyond twenty posts")
+        request("PUT", relation(feed_users[2]["id"]), feed_tokens[0])
+        authors = {u["id"] for u in feed_users[:3]}
+        expected = expected_feed(authors)
+        check(collect_feed() == expected, "exact merged Feed with ties, deletion and author filtering")
+        default_feed = request("GET", feed_path, feed_tokens[0])
+        check(default_feed["items"] == expected[:20] and default_feed["has_more"], "default Feed limit")
+        check(request("GET", feed_path + "?limit=", feed_tokens[0]) == default_feed, "empty Feed limit")
+        check(request("GET", feed_path + f"?user_id={feed_users[3]['id']}", feed_tokens[0]) == default_feed,
+              "Feed identity comes from the session")
+        check(feed_page(limit=100) == {"items": expected, "next_cursor": "", "has_more": False},
+              "maximum Feed limit and terminal state")
+        exact = feed_page(limit=len(expected))
+        check(exact["items"] == expected and not exact["has_more"], "exactly one full final page")
+        passed("Feed identity, self posts, current follows, historical posts and global pagination")
+
+        first_feed = feed_page()
+        feed_cursor = first_feed["next_cursor"]
+        request("GET", feed_path + "?cursor=" + feed_cursor, feed_tokens[1], status=400, code="invalid_cursor")
+        request("GET", api + f"/users/{reader}/posts?cursor={feed_cursor}", feed_tokens[0],
+                status=400, code="invalid_cursor")
+        reader_posts = request("GET", api + f"/users/{reader}/posts?limit=1", feed_tokens[0])
+        for wrong_cursor in [reader_posts["next_cursor"], cursor, "invalid!", "a" * 513]:
+            request("GET", feed_path + "?cursor=" + wrong_cursor, feed_tokens[0], status=400, code="invalid_cursor")
+        invalid_boundary = base64.urlsafe_b64encode(json.dumps(
+            {"owner": reader, "kind": "feed", "created_on": 0, "id": 1}).encode()).decode().rstrip("=")
+        request("GET", feed_path + "?cursor=" + invalid_boundary, feed_tokens[0], status=400, code="invalid_cursor")
+        for value in ["0", "101", "-1", "abc"]:
+            request("GET", feed_path + "?limit=" + value, feed_tokens[0], status=400, code="invalid_input")
+        passed("Feed cursor ownership and type, invalid boundaries and page limits")
+
+        boundary = first_feed["items"][-1]
+        author_token = feed_tokens[next(i for i, u in enumerate(feed_users) if u["id"] == boundary["author"]["id"])]
+        request("DELETE", post_path + f"/{boundary['id']}", author_token)
+        feed_posts.remove(boundary)
+        fresh_post = request("POST", post_path, feed_tokens[1], data={"content": "fresh Feed post"}, status=201)
+        feed_posts.append(fresh_post)
+        check(feed_page(feed_cursor)["items"] == expected[3:6], "Feed continuation after deleted boundary")
+        check(feed_page()["items"][0] == fresh_post, "refresh finds newly published Feed post")
+        request("DELETE", relation(feed_users[1]["id"]), feed_tokens[0])
+        remaining_authors = {reader, feed_users[2]["id"]}
+        check(collect_feed() == expected_feed(remaining_authors), "unfollow immediately filters new Feed reads")
+        remaining_after = [p for p in expected_feed(remaining_authors)
+                           if (p["created_on"], p["id"]) < (boundary["created_on"], boundary["id"])]
+        check(feed_page(feed_cursor)["items"] == remaining_after[:3], "old cursor applies current relationships")
+        check(request("GET", post_path + f"/{fresh_post['id']}", feed_tokens[0]) == fresh_post,
+              "unfollow preserves public detail access")
+        request("PUT", relation(feed_users[1]["id"]), feed_tokens[0])
+        check(collect_feed() == expected_feed(authors), "refollow restores effective history")
+        last = expected_feed(authors)[-1]
+        tail_cursor = base64.urlsafe_b64encode(json.dumps(
+            {"owner": reader, "kind": "feed", "created_on": last["created_on"], "id": last["id"]}
+        ).encode()).decode().rstrip("=")
+        check(feed_page(tail_cursor) == empty_feed, "Feed cursor beyond last result")
+        passed("Feed deletion, publication between pages, unfollow, refollow and exhausted cursor")
         stop_server()
         check(process.returncode == 0, "graceful shutdown")
         start_server()
         check(request("GET", api + "/me", token)["id"] == actor, "session survives restart")
+        check(request("GET", post_path + f"/{new_post['id']}", token) == new_post, "post survives restart")
+        request("GET", deleted_path, token, status=404, code="post_not_found")
+        check(collect_feed() == expected_feed(authors), "Feed survives application restart")
         passed("graceful shutdown and session persistence across restart")
         second_token = request("POST", api + "/login", data={"username": "alice", "password": password})["token"]
         request("POST", api + "/logout", token)
@@ -287,9 +499,18 @@ def main():
         sql("RENAME TABLE following TO following_unavailable;")
         try:
             request("GET", api + f"/users/{target}/following", tokens[1], status=500, code="internal_error")
+            request("GET", feed_path, feed_tokens[0], status=500, code="internal_error")
         finally:
             sql("RENAME TABLE following_unavailable TO following;")
         passed("database query errors remain errors rather than empty lists")
+        sql("RENAME TABLE posts TO posts_unavailable;")
+        try:
+            request("GET", api + f"/users/{actor}/posts", tokens[1], status=500, code="internal_error")
+            request("GET", feed_path, feed_tokens[0], status=500, code="internal_error")
+        finally:
+            sql("RENAME TABLE posts_unavailable TO posts;")
+        passed("post query errors are reported as internal errors")
+        passed("Feed dependency failures return errors")
         report["status"] = "passed"
     except Exception as exc:
         error = exc

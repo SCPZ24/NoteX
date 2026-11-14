@@ -66,7 +66,7 @@ func (h *handlers) listRelations(c *gin.Context, direction string) {
 		return
 	}
 	limit := 50
-	if value, exists := c.GetQuery("limit"); exists {
+	if value := c.Query("limit"); value != "" {
 		limit, err = strconv.Atoi(value)
 		if err != nil {
 			writeError(c, follow.ErrInvalid)

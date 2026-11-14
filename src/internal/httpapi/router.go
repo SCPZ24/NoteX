@@ -7,6 +7,7 @@ import (
 
 	"github.com/SCPZ24/NoteX/src/internal/account"
 	"github.com/SCPZ24/NoteX/src/internal/follow"
+	"github.com/SCPZ24/NoteX/src/internal/post"
 	"github.com/gin-gonic/gin"
 )
 
@@ -35,11 +36,12 @@ func NewRouter(pingDB func(context.Context) error) *gin.Engine {
 type handlers struct {
 	accounts *account.Service
 	follows  *follow.Service
+	posts    *post.Service
 }
 
 // RegisterAPI leaves the existing health routes available without authentication.
-func RegisterAPI(router *gin.Engine, accounts *account.Service, follows *follow.Service) {
-	h := &handlers{accounts: accounts, follows: follows}
+func RegisterAPI(router *gin.Engine, accounts *account.Service, follows *follow.Service, posts *post.Service) {
+	h := &handlers{accounts: accounts, follows: follows, posts: posts}
 	api := router.Group("/api/v1")
 	api.Use(func(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)
@@ -60,4 +62,9 @@ func RegisterAPI(router *gin.Engine, accounts *account.Service, follows *follow.
 	private.GET("/users/:id/follow", h.isFollowing)
 	private.GET("/users/:id/following", h.listFollowing)
 	private.GET("/users/:id/followers", h.listFollowers)
+	private.POST("/posts", h.createPost)
+	private.GET("/posts/:id", h.getPost)
+	private.DELETE("/posts/:id", h.deletePost)
+	private.GET("/users/:id/posts", h.listPosts)
+	private.GET("/feed", h.listFeed)
 }

@@ -1,0 +1,35 @@
+package httpapi
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+
+	"github.com/SCPZ24/NoteX/src/internal/account"
+	"github.com/SCPZ24/NoteX/src/internal/follow"
+	"github.com/gin-gonic/gin"
+)
+
+func writeError(c *gin.Context, err error) {
+	status, code := http.StatusInternalServerError, "internal_error"
+	switch {
+	case errors.Is(err, account.ErrInvalid), errors.Is(err, follow.ErrInvalid):
+		status, code = http.StatusBadRequest, "invalid_input"
+	case errors.Is(err, follow.ErrInvalidCursor):
+		status, code = http.StatusBadRequest, "invalid_cursor"
+	case errors.Is(err, account.ErrUnauthorized):
+		status, code = http.StatusUnauthorized, "unauthorized"
+	case errors.Is(err, account.ErrUsernameTaken):
+		status, code = http.StatusConflict, "username_taken"
+	case errors.Is(err, account.ErrNotFound), errors.Is(err, follow.ErrUserNotFound):
+		status, code = http.StatusNotFound, "user_not_found"
+	case errors.Is(err, follow.ErrBusy):
+		status, code = http.StatusServiceUnavailable, "relationship_busy"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		status, code = http.StatusServiceUnavailable, "request_unavailable"
+	default:
+		slog.Error("API operation failed", "route", c.FullPath(), "error", err)
+	}
+	c.AbortWithStatusJSON(status, gin.H{"error": code})
+}

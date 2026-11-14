@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/SCPZ24/NoteX/src/internal/account"
 	"github.com/SCPZ24/NoteX/src/internal/config"
+	"github.com/SCPZ24/NoteX/src/internal/follow"
 	"github.com/SCPZ24/NoteX/src/internal/httpapi"
 	"github.com/SCPZ24/NoteX/src/internal/platform/mysql"
 )
@@ -25,8 +27,10 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("listen for HTTP: %w", err)
 	}
+	router := httpapi.NewRouter(db.PingContext)
+	httpapi.RegisterAPI(router, account.New(db), follow.New(db))
 	server := &http.Server{
-		Handler:           httpapi.NewRouter(db.PingContext),
+		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,

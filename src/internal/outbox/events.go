@@ -6,6 +6,14 @@ import (
 	"encoding/json"
 )
 
+// Notify coalesces wakeups. Durable work remains in MySQL if the channel is full.
+func Notify(wake chan<- struct{}) {
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
 const (
 	PostCreated   = "post.created"
 	PostDeleted   = "post.deleted"

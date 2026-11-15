@@ -13,6 +13,7 @@ import (
 	"github.com/SCPZ24/NoteX/src/internal/config"
 	"github.com/SCPZ24/NoteX/src/internal/follow"
 	"github.com/SCPZ24/NoteX/src/internal/httpapi"
+	"github.com/SCPZ24/NoteX/src/internal/outbox"
 	"github.com/SCPZ24/NoteX/src/internal/platform/mysql"
 	"github.com/SCPZ24/NoteX/src/internal/post"
 )
@@ -29,7 +30,21 @@ func Run(ctx context.Context, cfg config.Config) error {
 		return fmt.Errorf("listen for HTTP: %w", err)
 	}
 	router := httpapi.NewRouter(db.PingContext)
-	httpapi.RegisterAPI(router, account.New(db), follow.New(db), post.New(db))
+	wake := make(chan struct{}, 1)
+	httpapi.RegisterAPI(router, account.New(db), follow.New(db, wake), post.New(db, wake))
+	if cfg.RabbitMQURL != "" {
+		workerCtx, cancelWorker := context.WithCancel(ctx)
+		workerDone := make(chan struct{})
+		go func() {
+			defer close(workerDone)
+			outbox.Run(workerCtx, db, wake, cfg.RabbitMQURL, cfg.QueuePrefix)
+		}()
+		// Stop the worker before closing the shared database pool.
+		defer func() {
+			cancelWorker()
+			<-workerDone
+		}()
+	}
 	server := &http.Server{
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,

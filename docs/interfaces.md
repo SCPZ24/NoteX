@@ -310,7 +310,7 @@ Go 负责执行顺序、判断实际变化和提交／回滚，MySQL 负责约�
 | `follow.created` | `actor_id` 为关注者，`target_user_id` 为被关注者 | 历史补入及可读取性更新 |
 | `follow.deleted` | `actor_id` 为关注者，`target_user_id` 为被关注者 | 取关后的派生状态维护 |
 
-表结构由 `id`、`event_type`、`payload`、`created_on` 组成。事件主键 `id` 是稳定身份，
+事件内容由 `id`、`event_type`、`payload`、`created_on` 组成。事件主键 `id` 是稳定身份，
 `created_on` 为 Unix 秒。Go 使用 `PostPayload` 和 `FollowPayload` 构造对应的 JSON 内容。
 帖子事件包含 `actor_id`、`post_id`，关系事件包含 `actor_id`、`target_user_id`。
 MySQL 的 JSON 类型检查语法，业务身份由 Service 的校验和同事务业务操作保证。
@@ -320,7 +320,7 @@ MySQL 的 JSON 类型检查语法，业务身份由 Service 的校验和同事�
 重新关注产生新的关系和新的事件。注册、登录等纯账号操作沿用自身事务语义。
 事件时间和自增 ID 不能作为事务提交顺序。后续消费者需要核对权威状态，处理重复、迟到及部分执行。
 
-当前事件持久保存在 MySQL，扫描投递与消费进度在 Sprint 2 后续步骤接入。
+当前事件持久保存在 MySQL，由后台任务投递到 RabbitMQ。消费进度在 Sprint 2 后续步骤接入。
 本次迁移创建事件表，事件覆盖升级后经业务接口实际发生的变更。
 升级前已有数据的派生状态初始化需要在 Feed／搜索接入时安排，原发布请求重试继续返回已保存结果。
 维护者可直接检查事件身份与关联对象。
@@ -330,6 +330,48 @@ SELECT id, event_type, payload, created_on
 FROM outbox_events
 ORDER BY id
 LIMIT 20;
+```
+
+### 后台投递与恢复
+
+运行前执行 `0004_outbox_events.sql`。`RABBITMQ_URL` 非空时启用投递，
+`RABBITMQ_QUEUE_PREFIX` 默认 `notex`，允许 1～64 个 ASCII 字母、数字、下划线或连字符。
+
+业务事务提交成功后向容量为 1 的 `chan struct{}` 发送非阻塞通知。
+多个通知合并后，后台任务按批次扫描 MySQL，每批最多 32 条。启动和每 5 秒轮询会找回遗漏通知及到期重试。
+扫描依据未投递、未永久失败和重试时间，持续覆盖较晚提交的小 ID。
+所有查询在网络投递前结束，等待 Broker 时数据库事务和行锁已释放。
+
+| 投递字段 | 含义 |
+|---|---|
+| `published_on` | 所有目标队列均获得发布确认的 Unix 秒，待投递时为空 |
+| `attempts` | 投递尝试次数，在网络操作前递增 |
+| `next_attempt_on` | 下一次允许尝试的 Unix 秒，初始为 0 |
+| `last_error` | 最近一次失败原因，成功后清空 |
+| `failed_on` | 无效内容或未知类型被隔离的时间，正常事件为空 |
+
+帖子事件分别发送到 `<prefix>.feed`、`<prefix>.search`，关系事件发送到 `<prefix>.feed`。
+通过 RabbitMQ 默认交换机按队列名路由，每个目标单独使用 `mandatory` 并等待 Publisher Confirm。
+客户端先处理 `basic.return`，确保不可路由的消息被记录为失败。队列为 durable classic，消息使用 persistent。
+每个进程的投递任务串行等待确认，消息携带稳定的 `event_id` 和相同的 AMQP `MessageId`。
+
+所有目标都确认后才写入 `published_on`。部分目标成功、确认丢失、确认后数据库更新失败，均可能产生重复投递。
+多实例同时扫描也可能重复发送同一事件，后续消费者需要通过事件身份与业务幂等处理。
+`published_on` 表示 Broker 交接成功，Feed 和搜索效果的完成时间由后续消费链路核对。
+
+连接失败、不可路由、确认超时或 NACK 会保留待办，重试等待为 1、2、4、8、16、32 秒，
+之后封顶 32 秒，实际执行还受 5 秒扫描间隔影响。失败扫描等待恢复定时器，新请求通知会合并。
+下一次连接会重新建立 Channel、队列和确认监听。单次数据库／MQ 操作期限为 5 秒，退出信号可取消操作。
+当前 Go 客户端的发布方法不响应 Context 取消阻塞写入，因此期限到达时关闭网络连接，保留不确定结果供重试。
+后台任务退出后再关闭 MySQL 连接池。无效事件保留 `failed_on` 与原因，显式重放入口在下一步实现。
+
+维护者可查询待投递与失败记录。
+
+```sql
+SELECT id, event_type, published_on, attempts, next_attempt_on, failed_on, last_error
+FROM outbox_events
+WHERE published_on IS NULL
+ORDER BY next_attempt_on, id;
 ```
 
 ## 错误响应
@@ -452,3 +494,25 @@ MQ 投递、真实 Feed／搜索副作用和规定轮数的精确故障窗口仍
 
 同日将事件内容调整为 JSON `payload` 后，Go 编译、现有测试及全部 27 组接口检查再次通过。
 脚本同时检查两种 payload 的准确字段集合与正整数 ID，隔离测试资源已清理。
+
+### RabbitMQ 投递执行记录
+
+2026-11-15 在本机 MySQL 9.6.0、RabbitMQ 4.2.9 和 amqp091-go v1.10.0 下执行。
+Go 编译、现有测试、27 组 API 回归均通过。独立投递实验约 115 秒完成以下检查。
+
+- 启动时恢复已提交但已失去 Channel 通知的事件，关系事件仅进入 Feed 队列。
+- 较小事件 ID 在较大 ID 已投递后才提交，由定时扫描恢复。
+- 删除搜索队列后，Feed 投递成功、搜索返回不可路由，事件保留失败原因。
+  重连恢复队列后重投，Feed 收到同一身份两次，搜索收到一次。
+- 20 轮通过触发器阻止确认后的 `published_on` 更新，重启投递 goroutine 后同一事件重新送达两个队列。
+  每轮逐项验证事件身份和内容，每个队列收到同一事件两次。
+- 未知事件类型与不合法 payload 共两条记录持久隔离，保留失败原因。
+- Broker 停止至少 60 秒，期间通过帖子 Service 提交 1 万次发布事务。
+  恢复后两个队列各核对 10001 个事件身份与完整内容，包含停机前已确认且保留在队列中的一条事件。
+- 独立真实 HTTP 验证通过注册、登录、发布、双队列投递和 SIGTERM 正常退出。
+  单次请求到确认约 27 毫秒，记录用于连通性检查。
+
+Broker 采样内存约 126～138 MiB，受容器 768 MiB 硬限制约束。镜像约 111 MiB，
+投递过程中数据卷采样约 5.2 MiB，测试清理后约 308 KiB。
+隔离数据库与队列已清理，RabbitMQ 容器及命名数据卷保留。
+确认窗口实验使用数据库故障与 goroutine 重启。确定位置强杀 Go 进程、消费者实际副作用与完整 S4 验收继续在后续步骤执行。

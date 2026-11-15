@@ -25,7 +25,7 @@ mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0004_outbo
 
 第一份迁移创建 `users`、`sessions`、`following` 三张表，第二份迁移创建 `posts` 表。
 第三份迁移创建 `post_requests` 表，保存发布请求标识和首次响应。发布接口要求携带 `Idempotency-Key`。
-第四份迁移创建 `outbox_events` 表，升级后的发布、删除和关系变更会在业务事务内记录事件。
+第四份迁移创建 `outbox_events` 表，包含投递状态、重试信息和扫描索引。升级后的发布、删除和关系变更会在业务事务内记录事件。
 帖子建表语句同时创建个人列表索引和有效帖全局时间索引。
 新数据库按编号依次执行，已有数据库从尚未执行的迁移继续。
 已有 Paopao 的 `p_*` 表和账号需要另行迁移。本 SQL 由维护者手工执行，成功后应记录执行版本。
@@ -36,11 +36,36 @@ MySQL DDL 会隐式提交，执行中断后应检查已创建的表，再从失�
 ```bash
 export MYSQL_DSN='notex:replace-with-your-password@tcp(127.0.0.1:3306)/notex'
 export HTTP_ADDR='127.0.0.1:8080'
+docker compose up -d rabbitmq
+export RABBITMQ_URL='amqp://notex:notex-local@127.0.0.1:5673/'
 go run ./src
 ```
 
 `MYSQL_DSN` 必填，`HTTP_ADDR` 默认是 `127.0.0.1:8080`。当前直接读取环境变量，不自动加载 `.env` 文件。
 启动时连接数据库失败会退出；数据库连接成功后才监听 HTTP。不要把真实连接凭据提交到仓库。
+
+Compose 提供本机 RabbitMQ，AMQP 端口为 5673，管理端口为 15673，示例账号为 `notex/notex-local`。
+镜像固定到本轮验证的摘要，运行版本为 4.2.9。资源上限为 2 CPU、768 MiB，数据保存在命名卷中。
+`RABBITMQ_URL` 非空时启动后台投递，留空时事件继续保存在 MySQL 中等待以后投递。
+`RABBITMQ_QUEUE_PREFIX` 默认 `notex`，生成 `notex.feed` 与 `notex.search` 两个持久化队列。
+后台任务由提交后的 Channel 通知唤醒，同时在启动及每 5 秒恢复扫描。
+MQ 暂时不可用时，投递失败信息和重试时间保存在数据库中，HTTP 写入继续使用业务事务。
+
+### 投递验证
+
+现有接口回归脚本独立验证数据库业务。真实 RabbitMQ 投递实验通过以下命令执行。
+
+```bash
+docker compose up -d rabbitmq
+NOTEX_INTEGRATION=1 GOMAXPROCS=2 GOMEMLIMIT=512MiB \
+  go test -p 2 -count=1 -timeout=15m -v ./src/internal/outbox
+```
+
+实验创建并清理独立 MySQL 数据库与独立队列，通过 `TEST_MYSQL_DSN` 指定管理连接，
+默认 `root@tcp(127.0.0.1:3306)/`。MQ 默认使用上面的 Compose 地址。
+实验会停止并启动本项目的 Compose RabbitMQ，保持停机至少 60 秒，期间提交 1 万次发布事务。
+执行前确保本项目 Broker 可供故障实验独占使用。数据卷在停止和启动之间保留。
+实验预算为 RabbitMQ 2 CPU／768 MiB，API／脚本 2 GiB，新增镜像、卷及证据合计 2 GiB。
 
 目前可以手工检查这两个接口：
 

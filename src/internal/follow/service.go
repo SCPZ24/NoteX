@@ -34,9 +34,12 @@ type Page struct {
 	HasMore    bool   `json:"has_more"`
 }
 
-type Service struct{ db *sql.DB }
+type Service struct {
+	db   *sql.DB
+	wake chan<- struct{}
+}
 
-func New(db *sql.DB) *Service { return &Service{db: db} }
+func New(db *sql.DB, wake chan<- struct{}) *Service { return &Service{db: db, wake: wake} }
 
 func (s *Service) Follow(ctx context.Context, actor, target int64) error {
 	if actor <= 0 || target <= 0 || actor == target {
@@ -113,7 +116,13 @@ func (s *Service) writeRelationship(ctx context.Context, actor, target int64, fo
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed > 0 {
+		outbox.Notify(s.wake)
+	}
+	return nil
 }
 
 func (s *Service) IsFollowing(ctx context.Context, actor, target int64) (bool, error) {

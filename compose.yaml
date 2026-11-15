@@ -1,0 +1,22 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4.2-management@sha256:7fa20d0d23d63ed90499bbf62e24af48ec4ae5eb22d173f3db96e3f85b26884a
+    hostname: notex-rabbitmq
+    ports:
+      - "127.0.0.1:5673:5672"
+      - "127.0.0.1:15673:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: notex
+      RABBITMQ_DEFAULT_PASS: notex-local
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 2:2 -rabbit disk_free_limit 268435456"
+    cpus: 2
+    mem_limit: 768m
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+volumes:
+  rabbitmq_data:

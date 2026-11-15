@@ -42,9 +42,12 @@ type Page struct {
 	HasMore    bool   `json:"has_more"`
 }
 
-type Service struct{ db *sql.DB }
+type Service struct {
+	db   *sql.DB
+	wake chan<- struct{}
+}
 
-func New(db *sql.DB) *Service { return &Service{db: db} }
+func New(db *sql.DB, wake chan<- struct{}) *Service { return &Service{db: db, wake: wake} }
 
 func (s *Service) Create(ctx context.Context, actor int64, requestKey, content string) (Post, error) {
 	content = strings.TrimSpace(content)
@@ -118,6 +121,7 @@ func (s *Service) Create(ctx context.Context, actor int64, requestKey, content s
 	if err := tx.Commit(); err != nil {
 		return Post{}, err
 	}
+	outbox.Notify(s.wake)
 	return item, nil
 }
 
@@ -194,7 +198,13 @@ func (s *Service) Delete(ctx context.Context, actor, id int64) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed > 0 {
+		outbox.Notify(s.wake)
+	}
+	return nil
 }
 
 func (s *Service) List(ctx context.Context, owner int64, after string, limit int) (Page, error) {

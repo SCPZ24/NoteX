@@ -16,7 +16,12 @@ func (h *handlers) createPost(c *gin.Context) {
 		writeError(c, post.ErrInvalid)
 		return
 	}
-	item, err := h.posts.Create(c.Request.Context(), currentUser(c).ID, input.Content)
+	keys := c.Request.Header.Values("Idempotency-Key")
+	if len(keys) != 1 {
+		writeError(c, post.ErrInvalid)
+		return
+	}
+	item, err := h.posts.Create(c.Request.Context(), currentUser(c).ID, keys[0], input.Content)
 	if err != nil {
 		writeError(c, err)
 		return

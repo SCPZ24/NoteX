@@ -109,8 +109,10 @@ def main():
         http_port = probe.getsockname()[1]
     base = f"http://127.0.0.1:{http_port}"
 
-    def request(method, path, token=None, data=None, status=200, code=None):
+    def request(method, path, token=None, data=None, status=200, code=None, request_key="auto"):
         headers = {"Content-Type": "application/json"}
+        if method == "POST" and path == "/api/v1/posts" and request_key is not None:
+            headers["Idempotency-Key"] = secrets.token_hex(16) if request_key == "auto" else request_key
         if token:
             headers["Authorization"] = "Bearer " + token
         body = None if data is None else json.dumps(data, ensure_ascii=False).encode()
@@ -153,6 +155,7 @@ def main():
         database_created = True
         sql((ROOT / "migrations/0001_accounts_follow.sql").read_text())
         sql((ROOT / "migrations/0002_posts.sql").read_text())
+        sql((ROOT / "migrations/0003_post_requests.sql").read_text())
         sql(f"CREATE USER '{database}'@'127.0.0.1' IDENTIFIED BY '{db_password}';", False)
         account_created = True
         sql(f"GRANT SELECT, INSERT, UPDATE, DELETE ON `{database}`.* TO '{database}'@'127.0.0.1';", False)
@@ -480,9 +483,88 @@ def main():
         ).encode()).decode().rstrip("=")
         check(feed_page(tail_cursor) == empty_feed, "Feed cursor beyond last result")
         passed("Feed deletion, publication between pages, unfollow, refollow and exhausted cursor")
+
+        # Keep publication retry fixtures independent of pagination expectations.
+        retry_user = request("POST", api + "/register",
+                             data={"username": "retry_writer", "password": password}, status=201)
+        retry_token = request("POST", api + "/login",
+                              data={"username": "retry_writer", "password": password})["token"]
+        retry_content = {"content": "并发发布 🌱"}
+        for invalid_key in [None, "", "a" * 129, "bad key", "bad,key", "bad/key"]:
+            request("POST", post_path, retry_token, data=retry_content,
+                    request_key=invalid_key, status=400, code="invalid_input")
+        check(sql(f"SELECT COUNT(*) FROM post_requests WHERE user_id={retry_user['id']};") == "0",
+              "invalid keys create no request records")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            retry_results = list(pool.map(lambda _: request(
+                "POST", post_path, retry_token, data=retry_content, status=201,
+                request_key="Concurrent-Key"), range(16)))
+        original_publication = retry_results[0]
+        check(all(item == original_publication for item in retry_results), "concurrent retries return identical results")
+        check(sql(f"SELECT COUNT(*) FROM posts WHERE author_id={retry_user['id']};") == "1",
+              "concurrent retries create exactly one post")
+        check(sql(f"SELECT COUNT(*) FROM post_requests WHERE user_id={retry_user['id']};") == "1",
+              "concurrent retries create exactly one request record")
+        check(request("POST", post_path, retry_token, data={"content": "  并发发布 🌱\n"}, status=201,
+                      request_key="Concurrent-Key") == original_publication, "normalized content replays")
+        request("POST", post_path, retry_token, data={"content": "different"},
+                request_key="Concurrent-Key", status=409, code="idempotency_conflict")
+        other_key = request("POST", post_path, retry_token, data=retry_content, status=201,
+                            request_key="concurrent-key")
+        check(other_key["id"] != original_publication["id"], "keys are case sensitive")
+        other_user = request("POST", post_path, tokens[1], data=retry_content, status=201,
+                             request_key="Concurrent-Key")
+        check(other_user["author"]["id"] == users[1]["id"] and other_user["id"] != original_publication["id"],
+              "publication key is scoped to authenticated user")
+        request("POST", post_path, retry_token, data=retry_content, status=201, request_key="k" * 128)
+        passed("publication key validation, concurrent retries, content conflicts and user scope")
+
+        # Fail after inserting the post, before saving the response. MySQL must
+        # roll back both the post and the request reservation.
+        before_failure = sql("SELECT COUNT(*) FROM posts;")
+        sql("CREATE TRIGGER fail_publication_result BEFORE UPDATE ON post_requests "
+            "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected result write failure';")
+        try:
+            request("POST", post_path, retry_token, data=retry_content, request_key="rollback-key",
+                    status=500, code="internal_error")
+        finally:
+            sql("DROP TRIGGER fail_publication_result;")
+        check(sql("SELECT COUNT(*) FROM posts;") == before_failure, "failed result write rolls back post")
+        check(sql("SELECT COUNT(*) FROM post_requests WHERE request_key='rollback-key';") == "0",
+              "failed result write rolls back reservation")
+        recovered_publication = request("POST", post_path, retry_token, data=retry_content,
+                                        request_key="rollback-key", status=201)
+        check(request("POST", post_path, retry_token, data=retry_content,
+                      request_key="rollback-key", status=201) == recovered_publication,
+              "rolled back key can be retried successfully")
+        passed("publication transaction rollback after post insertion and safe retry")
+
+        request("DELETE", post_path + f"/{original_publication['id']}", retry_token)
+        sql(f"UPDATE post_requests SET created_on=created_on-90000 WHERE user_id={retry_user['id']};")
+        before_replay = sql("SELECT COUNT(*) FROM posts;")
+        check(request("POST", post_path, retry_token, data=retry_content, status=201,
+                      request_key="Concurrent-Key") == original_publication, "deleted post replays original response after 25h")
+        request("GET", post_path + f"/{original_publication['id']}", retry_token,
+                status=404, code="post_not_found")
+        request("POST", post_path, retry_token, data={"content": "different"},
+                request_key="Concurrent-Key", status=409, code="idempotency_conflict")
+        check(sql("SELECT COUNT(*) FROM posts;") == before_replay, "replay never recreates deleted post")
+        passed("deleted publication identity and retention beyond 24 hours using aged records")
+
+        process.kill()
+        process.wait(timeout=5)
+        start_server()
+        check(request("POST", post_path, retry_token, data=retry_content, status=201,
+                      request_key="Concurrent-Key") == original_publication, "deleted result survives forced restart")
+        check(request("POST", post_path, retry_token, data=retry_content, status=201,
+                      request_key="rollback-key") == recovered_publication, "active result survives forced restart")
+        check(sql("SELECT COUNT(*) FROM posts;") == before_replay, "forced restart retries create no new posts")
+        passed("publication results survive forced application restart")
         stop_server()
         check(process.returncode == 0, "graceful shutdown")
         start_server()
+        check(request("POST", post_path, retry_token, data=retry_content, status=201,
+                      request_key="Concurrent-Key") == original_publication, "publication result survives graceful restart")
         check(request("GET", api + "/me", token)["id"] == actor, "session survives restart")
         check(request("GET", post_path + f"/{new_post['id']}", token) == new_post, "post survives restart")
         request("GET", deleted_path, token, status=404, code="post_not_found")

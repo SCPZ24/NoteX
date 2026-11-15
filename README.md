@@ -19,9 +19,11 @@ MySQL 8.0 的运行兼容性仍待实际验证。
 ```bash
 mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0001_accounts_follow.sql
 mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0002_posts.sql
+mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0003_post_requests.sql
 ```
 
 第一份迁移创建 `users`、`sessions`、`following` 三张表，第二份迁移创建 `posts` 表。
+第三份迁移创建 `post_requests` 表，保存发布请求标识和首次响应。发布接口要求携带 `Idempotency-Key`。
 帖子建表语句同时创建个人列表索引和有效帖全局时间索引。
 新数据库按编号依次执行，已有数据库从尚未执行的迁移继续。
 已有 Paopao 的 `p_*` 表和账号需要另行迁移。本 SQL 由维护者手工执行，成功后应记录执行版本。

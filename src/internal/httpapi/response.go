@@ -23,6 +23,8 @@ func writeError(c *gin.Context, err error) {
 		status, code = http.StatusUnauthorized, "unauthorized"
 	case errors.Is(err, account.ErrUsernameTaken):
 		status, code = http.StatusConflict, "username_taken"
+	case errors.Is(err, post.ErrRequestConflict):
+		status, code = http.StatusConflict, "idempotency_conflict"
 	case errors.Is(err, account.ErrNotFound), errors.Is(err, follow.ErrUserNotFound), errors.Is(err, post.ErrUserNotFound):
 		status, code = http.StatusNotFound, "user_not_found"
 	case errors.Is(err, post.ErrNotFound):

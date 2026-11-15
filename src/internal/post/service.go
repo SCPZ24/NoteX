@@ -3,18 +3,25 @@ package post
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 var (
-	ErrInvalid      = errors.New("invalid post input or page size")
-	ErrNotFound     = errors.New("post not found")
-	ErrUserNotFound = errors.New("user not found")
-	ErrForbidden    = errors.New("only the author can delete a post")
+	ErrInvalid         = errors.New("invalid post input or page size")
+	ErrNotFound        = errors.New("post not found")
+	ErrUserNotFound    = errors.New("user not found")
+	ErrForbidden       = errors.New("only the author can delete a post")
+	ErrRequestConflict = errors.New("publication key already used with different content")
 )
+
+var requestKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 type Author struct {
 	ID       int64  `json:"id"`
@@ -38,13 +45,42 @@ type Service struct{ db *sql.DB }
 
 func New(db *sql.DB) *Service { return &Service{db: db} }
 
-func (s *Service) Create(ctx context.Context, actor int64, content string) (Post, error) {
+func (s *Service) Create(ctx context.Context, actor int64, requestKey, content string) (Post, error) {
 	content = strings.TrimSpace(content)
-	if actor <= 0 || !utf8.ValidString(content) || content == "" || utf8.RuneCountInString(content) > 500 {
+	if actor <= 0 || !requestKeyPattern.MatchString(requestKey) || !utf8.ValidString(content) || content == "" || utf8.RuneCountInString(content) > 500 {
 		return Post{}, ErrInvalid
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Post{}, err
+	}
+	defer tx.Rollback()
+
+	createdOn := time.Now().Unix()
+	// The unique key arbitrates concurrent requests. All writes use this Tx,
+	// so the reservation is committed only with the post and its saved result.
+	_, err = tx.ExecContext(ctx,
+		"INSERT INTO post_requests (user_id, request_key, content, created_on) VALUES (?, ?, ?, ?)",
+		actor, requestKey, content, createdOn)
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		switch mysqlErr.Number {
+		case 1062:
+			if err := tx.Rollback(); err != nil {
+				return Post{}, err
+			}
+			// Read outside the losing transaction to see the winner's committed
+			// result, independently of any REPEATABLE READ snapshot.
+			return s.replay(ctx, actor, requestKey, content)
+		case 1452:
+			return Post{}, ErrUserNotFound
+		}
+	}
+	if err != nil {
+		return Post{}, err
+	}
 	var author Author
-	err := s.db.QueryRowContext(ctx, "SELECT id, username FROM users WHERE id = ?", actor).
+	err = tx.QueryRowContext(ctx, "SELECT id, username FROM users WHERE id = ?", actor).
 		Scan(&author.ID, &author.Username)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Post{}, ErrUserNotFound
@@ -52,15 +88,52 @@ func (s *Service) Create(ctx context.Context, actor int64, content string) (Post
 	if err != nil {
 		return Post{}, err
 	}
-	item := Post{Author: author, Content: content, CreatedOn: time.Now().Unix()}
-	result, err := s.db.ExecContext(ctx,
+	item := Post{Author: author, Content: content, CreatedOn: createdOn}
+	result, err := tx.ExecContext(ctx,
 		"INSERT INTO posts (author_id, content, created_on) VALUES (?, ?, ?)",
 		actor, item.Content, item.CreatedOn)
 	if err != nil {
 		return Post{}, err
 	}
 	item.ID, err = result.LastInsertId()
-	return item, err
+	if err != nil {
+		return Post{}, err
+	}
+	response, err := json.Marshal(item)
+	if err != nil {
+		return Post{}, err
+	}
+	_, err = tx.ExecContext(ctx,
+		"UPDATE post_requests SET post_id = ?, response_json = ? WHERE user_id = ? AND request_key = ?",
+		item.ID, string(response), actor, requestKey)
+	if err != nil {
+		return Post{}, err
+	}
+	// A lost COMMIT reply can leave the outcome unknown to Go. Return the error
+	// and let the client retry with the same key to discover the durable result.
+	if err := tx.Commit(); err != nil {
+		return Post{}, err
+	}
+	return item, nil
+}
+
+func (s *Service) replay(ctx context.Context, actor int64, requestKey, content string) (Post, error) {
+	var savedContent string
+	var response []byte
+	err := s.db.QueryRowContext(ctx,
+		"SELECT content, response_json FROM post_requests WHERE user_id = ? AND request_key = ?",
+		actor, requestKey).Scan(&savedContent, &response)
+	if err != nil {
+		return Post{}, err
+	}
+	if savedContent != content {
+		return Post{}, ErrRequestConflict
+	}
+	var item Post
+	if err := json.Unmarshal(response, &item); err != nil {
+		return Post{}, err
+	}
+	return item, nil
 }
 
 func (s *Service) Get(ctx context.Context, id int64) (Post, error) {

@@ -320,7 +320,7 @@ MySQL 的 JSON 类型检查语法，业务身份由 Service 的校验和同事�
 重新关注产生新的关系和新的事件。注册、登录等纯账号操作沿用自身事务语义。
 事件时间和自增 ID 不能作为事务提交顺序。后续消费者需要核对权威状态，处理重复、迟到及部分执行。
 
-当前事件持久保存在 MySQL，由后台任务投递到 RabbitMQ。消费进度在 Sprint 2 后续步骤接入。
+当前事件持久保存在 MySQL，由后台任务投递到 RabbitMQ。消费任务与失败处置已通过下述显式 Dummy 入口接入。
 本次迁移创建事件表，事件覆盖升级后经业务接口实际发生的变更。
 升级前已有数据的派生状态初始化需要在 Feed／搜索接入时安排，原发布请求重试继续返回已保存结果。
 维护者可直接检查事件身份与关联对象。
@@ -363,7 +363,7 @@ LIMIT 20;
 之后封顶 32 秒，实际执行还受 5 秒扫描间隔影响。失败扫描等待恢复定时器，新请求通知会合并。
 下一次连接会重新建立 Channel、队列和确认监听。单次数据库／MQ 操作期限为 5 秒，退出信号可取消操作。
 当前 Go 客户端的发布方法不响应 Context 取消阻塞写入，因此期限到达时关闭网络连接，保留不确定结果供重试。
-后台任务退出后再关闭 MySQL 连接池。无效事件保留 `failed_on` 与原因，显式重放入口在下一步实现。
+后台任务退出后再关闭 MySQL 连接池。无效事件保留 `failed_on` 与原因，可通过下述命令行入口查询和显式重放。
 
 维护者可查询待投递与失败记录。
 
@@ -373,6 +373,89 @@ FROM outbox_events
 WHERE published_on IS NULL
 ORDER BY next_attempt_on, id;
 ```
+
+### 消费任务、确认与恢复
+
+执行 `0005_event_consumption.sql` 后可启动显式测试消费者。每条消费路径拥有独立 AMQP 连接，
+通过 `Qos(1)` 限制未确认消息数，并逐条处理。连接异常后关闭旧连接，按 5 秒恢复节奏重连。
+Feed、Search 各自的恢复任务也在连接前扫描，因此已持久化的任务可在 MQ 不可用期间继续处理。
+
+```mermaid
+sequenceDiagram
+    participant MQ as RabbitMQ
+    participant C as Go 消费协程
+    participant DB as MySQL
+    MQ->>C: 投递消息
+    C->>DB: 持久保存原始消息与消费任务
+    C->>DB: 锁定任务行并开始处理事务
+    C->>DB: 写入 Dummy 效果与完成状态
+    DB-->>C: 提交成功
+    C->>MQ: 手动 ACK
+```
+
+`consumption_jobs` 的 `consumer` 保存完整队列名。合法消息以该消费路径与 `event_id` 为唯一身份，
+Feed 和 Search 分别完成自己的任务。重复消息保留原任务状态和重试时间。
+同一身份出现不同原始消息字节时，新增隔离记录保存冲突输入，原任务保持自身处理进度。
+JSON 无效、空消息、ID 不匹配、未知类型、错误目标等输入，以消息 ID 和原始字节的 SHA-256 指纹去重并隔离。
+
+| 消费字段 | 含义 |
+|---|---|
+| `status` | `pending` 等待执行、`completed` 已完成、`failed` 等待人工处置 |
+| `attempts` | 已提交的处理尝试累计次数，事务整体回滚时本次计数也回滚 |
+| `cycle_attempts` | 当前自动重试周期的尝试次数，显式重放时归零 |
+| `next_attempt_on` | 最早允许重试的 Unix 秒 |
+| `last_error` | 最近失败原因，完成后清空；重放前错误同时保存到重放记录 |
+| `body`、`message_id` | 原始消息与 AMQP MessageId，用于核对和恢复 |
+| `completed_on`、`failed_on` | 完成或停止自动处理的时间 |
+
+`SQLHandler` 接收当前 MySQL 事务。任务行通过 `FOR UPDATE` 串行化重复处理，
+Dummy 效果与完成状态在同一事务提交。处理前建立保存点，处理函数返回错误时回滚到保存点，
+撤销本次 SQL 效果，再保存错误和重试状态。事务死锁、数据库断连等导致整体回滚时，现有待办仍可恢复。
+
+普通处理错误最多自动尝试 5 次，失败后等待 1、2、4、8 秒，第 5 次失败进入 `failed`。
+实际执行时间还受扫描节奏影响。处理函数返回包含 `ErrPermanent` 的错误时立即进入 `failed`。
+这些次数适用于已保存的处理结果，数据库基础设施故障通过关闭消费连接和延迟恢复保留工作。
+
+成功结果、后续重试任务或隔离记录持久化后才 ACK。保存失败时关闭连接，保留 Broker 重投机会。
+因此 ACK 表示交付责任已经由持久结果或 MySQL 待办接管。最终效果需查询 `completed` 和实际目标数据。
+任务提交后 ACK 丢失会导致重复投递，已完成任务跳过处理并再次确认。
+
+### 查询与显式重放命令
+
+命令复用 `MYSQL_DSN`、`RABBITMQ_URL` 和 `RABBITMQ_QUEUE_PREFIX`。
+查询和重放通过 `go run ./src/cmd/events` 执行。
+
+```bash
+go run ./src/cmd/events list --scope consumer --status failed --limit 20
+go run ./src/cmd/events list --scope consumer --id 123
+go run ./src/cmd/events list --scope consumer --after 123 --limit 20
+go run ./src/cmd/events replay --scope consumer --id 123 --reason '故障修复后恢复'
+go run ./src/cmd/events list --scope outbox --status pending
+go run ./src/cmd/events replay --scope outbox --id 456 --reason '已修复待投递事件'
+```
+
+`--id` 为对应表的记录 ID。列表返回 JSON，包含状态、尝试次数、错误、下一次执行时间，
+`body_base64` 使用 Base64 无损表示消息原始字节；Outbox 查询的该字段为事件 payload。
+消费查询中的 `consumer` 为完整队列名，`event_id` 为原始事件身份。
+单条查询附带最近 100 次重放记录，记录中包含操作者提供的原因、此前错误与时间。
+
+消费侧仅允许重放 `failed` 的合法原任务。重放事务同时插入 `event_replays`、恢复 `pending`、
+清空失败时间并重置本周期次数，保留原事件 ID 和累计尝试次数。多个并发重放请求通过行锁串行化，
+第一个请求调度成功后，后续请求会收到状态不满足错误。已完成任务保持完成状态。
+
+Outbox 允许重放尚未完成投递且已有错误记录的事件。重放前重新校验事件类型和 payload，
+修复后恢复自动投递，正常扫描负责执行。未知或错误内容需先修复源事件。
+消费侧的无效字节和身份冲突保留在隔离记录中，修复来源后提交合法消息，便于保留原始证据。
+
+### Dummy 范围与部分执行恢复
+
+`go run ./src/cmd/events dummy` 启动 Feed、Search 两个测试消费协程。
+命令要求 `RABBITMQ_URL` 非空，队列前缀以 `notex_dummy_` 开头。API 与 Dummy 使用相同测试数据库及前缀，
+业务写入即可产生测试消息。测试效果写入 `dummy_effects`，每个消费路径和事件只产生一份效果。
+
+当前部分执行验证采用 SQL 写入后返回错误，并检查保存点回滚和重试后的完整效果。
+提交后未确认窗口采用关闭 AMQP 连接并重新消费验证。真实 Redis Timeline、Meilisearch 写入跨越 MySQL 事务，
+需要在 Sprint 3、4 分别落实幂等写入、进度跟踪与恢复。第五步继续补充确定位置的进程强制退出与多轮核对。
 
 ## 错误响应
 
@@ -516,3 +599,19 @@ Broker 采样内存约 126～138 MiB，受容器 768 MiB 硬限制约束。镜�
 投递过程中数据卷采样约 5.2 MiB，测试清理后约 308 KiB。
 隔离数据库与队列已清理，RabbitMQ 容器及命名数据卷保留。
 确认窗口实验使用数据库故障与 goroutine 重启。确定位置强杀 Go 进程、消费者实际副作用与完整 S4 验收继续在后续步骤执行。
+
+### 第四步消费执行记录
+
+2026-11-15，消费集成测试的 11 组检查通过，并通过 Go race detector。
+覆盖并发重复处理、Feed／Search 独立身份、SQL 部分效果回滚、退避与五次尝试上限、
+永久失败、并发显式重放、无效字节及身份冲突隔离、提交后 ACK 丢失、接收记录写入失败、
+消费进程重启、MQ 不可连接时的持久任务恢复，以及真实 CLI 查询／重放／Dummy 正常启停。
+
+同轮执行全量 Go 测试、原发布集成实验和 27 组 HTTP 回归，均通过。
+发布实验再次完成 20 轮确认后回写失败恢复，以及 MQ 停机至少 60 秒期间保留 1 万条事件并恢复投递。
+完整 Go 测试约 150 秒，`time -l` 报告最大 RSS 约 233 MiB，使用 2 个 Go 执行线程和 512 MiB Go 内存目标。
+RabbitMQ 沿用 2 CPU／768 MiB 容器限制，API／脚本沿用 2 GiB 预算。
+隔离数据库和队列清理完成，RabbitMQ 恢复运行并保留数据卷。
+
+本轮消费效果限于 Dummy 的 MySQL 写入。消费窗口通过受控 SQL 错误、AMQP 连接关闭和 worker 重启验证，
+确定位置的消费进程强杀和正式多轮故障台账继续在第五步完成。

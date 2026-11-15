@@ -158,6 +158,7 @@ def main():
         sql((ROOT / "migrations/0002_posts.sql").read_text())
         sql((ROOT / "migrations/0003_post_requests.sql").read_text())
         sql((ROOT / "migrations/0004_outbox_events.sql").read_text())
+        sql((ROOT / "migrations/0005_event_consumption.sql").read_text())
         sql(f"CREATE USER '{database}'@'127.0.0.1' IDENTIFIED BY '{db_password}';", False)
         account_created = True
         sql(f"GRANT SELECT, INSERT, UPDATE, DELETE ON `{database}`.* TO '{database}'@'127.0.0.1';", False)

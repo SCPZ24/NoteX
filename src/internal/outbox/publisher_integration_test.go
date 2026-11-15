@@ -87,7 +87,7 @@ func TestPublisherIntegration(t *testing.T) {
 		}
 		return result
 	}
-	for _, migration := range []string{"0001_accounts_follow.sql", "0002_posts.sql", "0003_post_requests.sql", "0004_outbox_events.sql"} {
+	for _, migration := range []string{"0001_accounts_follow.sql", "0002_posts.sql", "0003_post_requests.sql", "0004_outbox_events.sql", "0005_event_consumption.sql"} {
 		body, err := os.ReadFile(filepath.Join(root, "migrations", migration))
 		if err != nil {
 			t.Fatal(err)

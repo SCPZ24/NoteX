@@ -15,7 +15,8 @@ const (
 	batchSize    = 32
 )
 
-type event struct {
+// Event is the stable envelope shared by the publisher and consumers.
+type Event struct {
 	ID        int64           `json:"event_id"`
 	Type      string          `json:"event_type"`
 	Payload   json.RawMessage `json:"payload"`
@@ -71,7 +72,7 @@ func drain(ctx context.Context, db *sql.DB, b *broker) error {
 	return ctx.Err()
 }
 
-func pending(ctx context.Context, db *sql.DB) ([]event, error) {
+func pending(ctx context.Context, db *sql.DB) ([]Event, error) {
 	ctx, cancel := context.WithTimeout(ctx, operationTimeout)
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `SELECT id, event_type, payload, created_on, attempts
@@ -81,9 +82,9 @@ func pending(ctx context.Context, db *sql.DB) ([]event, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var events []event
+	var events []Event
 	for rows.Next() {
-		var item event
+		var item Event
 		if err := rows.Scan(&item.ID, &item.Type, &item.Payload, &item.CreatedOn, &item.Attempts); err != nil {
 			return nil, err
 		}
@@ -92,7 +93,7 @@ func pending(ctx context.Context, db *sql.DB) ([]event, error) {
 	return events, rows.Err()
 }
 
-func (e event) destinations(prefix string) ([]string, error) {
+func (e Event) destinations(prefix string) ([]string, error) {
 	switch e.Type {
 	case PostCreated, PostDeleted:
 		var payload PostPayload
@@ -111,7 +112,7 @@ func (e event) destinations(prefix string) ([]string, error) {
 	}
 }
 
-func deliver(ctx context.Context, db *sql.DB, b *broker, item event) error {
+func deliver(ctx context.Context, db *sql.DB, b *broker, item Event) error {
 	queues, err := item.destinations(b.prefix)
 	if err != nil {
 		_, saveErr := update(ctx, db, `UPDATE outbox_events SET failed_on = ?, last_error = ?

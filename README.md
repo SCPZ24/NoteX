@@ -21,11 +21,13 @@ mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0001_accou
 mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0002_posts.sql
 mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0003_post_requests.sql
 mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0004_outbox_events.sql
+mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0005_event_consumption.sql
 ```
 
 第一份迁移创建 `users`、`sessions`、`following` 三张表，第二份迁移创建 `posts` 表。
 第三份迁移创建 `post_requests` 表，保存发布请求标识和首次响应。发布接口要求携带 `Idempotency-Key`。
 第四份迁移创建 `outbox_events` 表，包含投递状态、重试信息和扫描索引。升级后的发布、删除和关系变更会在业务事务内记录事件。
+第五份迁移创建消费任务、显式重放记录和 Dummy 测试效果表。
 帖子建表语句同时创建个人列表索引和有效帖全局时间索引。
 新数据库按编号依次执行，已有数据库从尚未执行的迁移继续。
 已有 Paopao 的 `p_*` 表和账号需要另行迁移。本 SQL 由维护者手工执行，成功后应记录执行版本。
@@ -66,6 +68,49 @@ NOTEX_INTEGRATION=1 GOMAXPROCS=2 GOMEMLIMIT=512MiB \
 实验会停止并启动本项目的 Compose RabbitMQ，保持停机至少 60 秒，期间提交 1 万次发布事务。
 执行前确保本项目 Broker 可供故障实验独占使用。数据卷在停止和启动之间保留。
 实验预算为 RabbitMQ 2 CPU／768 MiB，API／脚本 2 GiB，新增镜像、卷及证据合计 2 GiB。
+
+### 消费验证与失败处置
+
+第四步提供手动 ACK、按消费路径幂等、持久重试、失败隔离和命令行查询／重放。
+真实 Feed 和 Meilisearch 处理器分别在 Sprint 3、4 接入。当前通过独立 Dummy 命令写入可核对的 SQL 测试效果。
+HTTP 启动入口继续负责业务与 Outbox 发布，Dummy 消费需要显式启动。
+
+在执行完五份迁移的独立测试数据库中，将 API 与 Dummy 进程的队列前缀设置为相同测试值。
+以下命令沿用前面设置的 `MYSQL_DSN` 与 `RABBITMQ_URL`。
+
+```bash
+export RABBITMQ_QUEUE_PREFIX=notex_dummy_demo
+go run ./src
+# 在第二个终端设置相同的三个环境变量，再启动消费者。
+go run ./src/cmd/events dummy
+```
+
+Dummy 命令要求队列前缀以 `notex_dummy_` 开头，以明确区分测试消费。
+发布接口产生的帖子事件会分别在 `dummy_effects` 中留下 Feed 和 Search 两份结果。
+SQL 测试效果与消费完成记录在同一个 MySQL 事务提交。真实外部写入的恢复窗口在后续 Sprint 验证。
+
+```bash
+go run ./src/cmd/events list --scope consumer --status failed
+go run ./src/cmd/events list --scope consumer --id 123
+go run ./src/cmd/events replay --scope consumer --id 123 --reason '依赖恢复后重新处理'
+go run ./src/cmd/events list --scope outbox --status pending
+go run ./src/cmd/events replay --scope outbox --id 456 --reason '源事件修复后重新投递'
+```
+
+`--id` 使用相应表的记录主键。列表最多返回 100 条，通过 `--after` 翻页。
+查询单条记录会同时返回最近 100 次重放原因和重放前错误。原始消息以 `body_base64` 保留任意字节。
+重放保留事件身份和累计尝试次数，消费重放重新获得最多 5 次自动尝试机会。
+无效消息和身份冲突保留原始证据，需要修复来源后重新提交合法消息。
+
+消费集成测试使用隔离数据库和队列，结束后自动清理，沿用前面约定的测试资源预算。
+
+```bash
+NOTEX_CONSUMER_INTEGRATION=1 GOMAXPROCS=2 GOMEMLIMIT=512MiB \
+  go test -race -p 2 -count=1 -timeout=3m -run TestConsumerIntegration -v ./src/internal/outbox
+```
+
+代码建议按 `migrations/0005_event_consumption.sql`、`consumer.go`、`operations.go`、
+`src/cmd/events/main.go`、`consumer_integration_test.go` 的顺序阅读，后三个 Go 模块位于对应的消费包或命令目录。
 
 目前可以手工检查这两个接口：
 

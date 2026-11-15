@@ -156,6 +156,7 @@ def main():
         sql((ROOT / "migrations/0001_accounts_follow.sql").read_text())
         sql((ROOT / "migrations/0002_posts.sql").read_text())
         sql((ROOT / "migrations/0003_post_requests.sql").read_text())
+        sql((ROOT / "migrations/0004_outbox_events.sql").read_text())
         sql(f"CREATE USER '{database}'@'127.0.0.1' IDENTIFIED BY '{db_password}';", False)
         account_created = True
         sql(f"GRANT SELECT, INSERT, UPDATE, DELETE ON `{database}`.* TO '{database}'@'127.0.0.1';", False)
@@ -484,11 +485,15 @@ def main():
         check(feed_page(tail_cursor) == empty_feed, "Feed cursor beyond last result")
         passed("Feed deletion, publication between pages, unfollow, refollow and exhausted cursor")
 
+        # Account-only operations must not create events.
+        account_events_before = sql("SELECT COUNT(*) FROM outbox_events;")
         # Keep publication retry fixtures independent of pagination expectations.
         retry_user = request("POST", api + "/register",
                              data={"username": "retry_writer", "password": password}, status=201)
         retry_token = request("POST", api + "/login",
                               data={"username": "retry_writer", "password": password})["token"]
+        check(sql("SELECT COUNT(*) FROM outbox_events;") == account_events_before,
+              "registration and login create no events")
         retry_content = {"content": "并发发布 🌱"}
         for invalid_key in [None, "", "a" * 129, "bad key", "bad,key", "bad/key"]:
             request("POST", post_path, retry_token, data=retry_content,
@@ -505,6 +510,12 @@ def main():
               "concurrent retries create exactly one post")
         check(sql(f"SELECT COUNT(*) FROM post_requests WHERE user_id={retry_user['id']};") == "1",
               "concurrent retries create exactly one request record")
+        publication_event = sql("SELECT id, event_type, payload->>'$.actor_id', payload->>'$.post_id' "
+                                f"FROM outbox_events WHERE payload->>'$.post_id'={original_publication['id']};")
+        event_fields = publication_event.split()
+        check(len(event_fields) == 4 and event_fields[1:] == [
+            "post.created", str(retry_user["id"]), str(original_publication["id"])],
+            "concurrent publication creates one identifiable event")
         check(request("POST", post_path, retry_token, data={"content": "  并发发布 🌱\n"}, status=201,
                       request_key="Concurrent-Key") == original_publication, "normalized content replays")
         request("POST", post_path, retry_token, data={"content": "different"},
@@ -539,6 +550,66 @@ def main():
               "rolled back key can be retried successfully")
         passed("publication transaction rollback after post insertion and safe retry")
 
+        outbox_post = request("POST", post_path, retry_token, data={"content": "outbox rollback"}, status=201)
+        present_target, absent_target = users[1]["id"], users[2]["id"]
+        request("PUT", relation(present_target), retry_token)
+
+        def durable_snapshot():
+            return {table: sql(f"SELECT * FROM {table} ORDER BY 1, 2;")
+                    for table in ["posts", "post_requests", "following", "outbox_events"]}
+
+        before_outbox_failure = durable_snapshot()
+        sql("CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox_events "
+            "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected outbox write failure';")
+        try:
+            request("POST", post_path, retry_token, data=retry_content, request_key="outbox-rollback",
+                    status=500, code="internal_error")
+            request("DELETE", post_path + f"/{outbox_post['id']}", retry_token,
+                    status=500, code="internal_error")
+            request("PUT", relation(absent_target), retry_token, status=500, code="internal_error")
+            request("DELETE", relation(present_target), retry_token, status=500, code="internal_error")
+            # No-op operations do not attempt to insert an event.
+            request("PUT", relation(present_target), retry_token)
+            request("DELETE", relation(absent_target), retry_token)
+            check(request("POST", post_path, retry_token, data=retry_content, status=201,
+                          request_key="Concurrent-Key") == original_publication,
+                  "publication replay requires no new event")
+        finally:
+            sql("DROP TRIGGER fail_outbox;")
+        check(durable_snapshot() == before_outbox_failure,
+              "all four business mutations roll back when event insertion fails")
+        passed("outbox failure rolls back publication, deletion, follow and unfollow")
+
+        # Exercise the existing bounded deadlock retry at the event-write stage.
+        sql("CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox_events "
+            "FOR EACH ROW SIGNAL SQLSTATE '40001' SET MYSQL_ERRNO=1213, MESSAGE_TEXT='injected deadlock';")
+        try:
+            request("PUT", relation(absent_target), retry_token, status=503, code="relationship_busy")
+            request("DELETE", relation(present_target), retry_token, status=503, code="relationship_busy")
+        finally:
+            sql("DROP TRIGGER fail_outbox;")
+        check(durable_snapshot() == before_outbox_failure, "exhausted deadlock retries leave no partial writes")
+        passed("relationship deadlock retry includes business change and event")
+
+        request("POST", post_path, retry_token, data=retry_content, request_key="outbox-rollback", status=201)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda _: request("DELETE", post_path + f"/{outbox_post['id']}", retry_token), range(16)))
+            list(pool.map(lambda _: request("PUT", relation(absent_target), retry_token), range(16)))
+            list(pool.map(lambda _: request("DELETE", relation(present_target), retry_token), range(16)))
+        check(sql(f"SELECT COUNT(*) FROM outbox_events WHERE event_type='post.deleted' "
+                  f"AND payload->>'$.post_id'={outbox_post['id']};") == "1", "concurrent deletion records one event")
+        check(sql(f"SELECT COUNT(*) FROM outbox_events WHERE payload->>'$.actor_id'={retry_user['id']} "
+                  f"AND payload->>'$.target_user_id'={absent_target} AND event_type='follow.created';") == "1",
+              "concurrent follow records one event")
+        check(sql(f"SELECT COUNT(*) FROM outbox_events WHERE payload->>'$.actor_id'={retry_user['id']} "
+                  f"AND payload->>'$.target_user_id'={present_target} AND event_type='follow.deleted';") == "1",
+              "concurrent unfollow records one event")
+        request("PUT", relation(present_target), retry_token)
+        check(sql(f"SELECT COUNT(*) FROM outbox_events WHERE payload->>'$.actor_id'={retry_user['id']} "
+                  f"AND payload->>'$.target_user_id'={present_target} AND event_type='follow.created';") == "2",
+              "refollow creates a new event")
+        passed("outbox recovery and concurrent no-op operations preserve event cardinality")
+
         request("DELETE", post_path + f"/{original_publication['id']}", retry_token)
         sql(f"UPDATE post_requests SET created_on=created_on-90000 WHERE user_id={retry_user['id']};")
         before_replay = sql("SELECT COUNT(*) FROM posts;")
@@ -551,6 +622,43 @@ def main():
         check(sql("SELECT COUNT(*) FROM posts;") == before_replay, "replay never recreates deleted post")
         passed("deleted publication identity and retention beyond 24 hours using aged records")
 
+        # Reconcile identities and effects, including earlier mixed concurrent
+        # follow/unfollow requests. Fixture timestamp updates do not change IDs.
+        for row in sql("SELECT event_type, payload FROM outbox_events;").splitlines():
+            kind, raw_payload = row.split("\t", 1)
+            payload = json.loads(raw_payload)
+            subject = "post_id" if kind.startswith("post.") else "target_user_id"
+            check(set(payload) == {"actor_id", subject}, "payload contains exactly the event's fields")
+            check(all(type(value) is int and value > 0 for value in payload.values()), "payload contains positive integer IDs")
+        events = [row.split() for row in sql(
+            "SELECT id, event_type, payload->>'$.actor_id', "
+            "COALESCE(payload->>'$.post_id',0), COALESCE(payload->>'$.target_user_id',0) "
+            "FROM outbox_events ORDER BY id;").splitlines()]
+        expected_post_events = []
+        for row in sql("SELECT id, author_id, deleted_on IS NOT NULL FROM posts;").splitlines():
+            post_id, author_id, deleted = map(int, row.split())
+            expected_post_events.append(("post.created", author_id, post_id))
+            if deleted:
+                expected_post_events.append(("post.deleted", author_id, post_id))
+        actual_post_events = [(kind, int(actor_id), int(post_id))
+                              for _, kind, actor_id, post_id, _ in events if kind.startswith("post.")]
+        check(sorted(actual_post_events) == sorted(expected_post_events), "every post effect has exactly one event")
+        relation_balances = {}
+        for _, kind, actor_id, _, target_id in events:
+            if kind.startswith("follow."):
+                pair = (int(actor_id), int(target_id))
+                relation_balances[pair] = relation_balances.get(pair, 0) + (1 if kind == "follow.created" else -1)
+        current_pairs = {tuple(map(int, row.split())) for row in sql(
+            "SELECT user_id, follow_id FROM following;").splitlines()}
+        check(all(balance in (0, 1) for balance in relation_balances.values()), "relationship event balance")
+        check({pair for pair, balance in relation_balances.items() if balance == 1} == current_pairs,
+              "relationship event effects match authoritative relationships")
+        check(sql("SELECT id, event_type, payload->>'$.actor_id', payload->>'$.post_id' FROM outbox_events "
+                  f"WHERE payload->>'$.post_id'={original_publication['id']} AND event_type='post.created';") == publication_event,
+              "publication retries and deletion retain original event identity")
+        saved_events = sql("SELECT * FROM outbox_events ORDER BY id;")
+        passed("outbox identities reconcile with posts and current relationships")
+
         process.kill()
         process.wait(timeout=5)
         start_server()
@@ -559,10 +667,12 @@ def main():
         check(request("POST", post_path, retry_token, data=retry_content, status=201,
                       request_key="rollback-key") == recovered_publication, "active result survives forced restart")
         check(sql("SELECT COUNT(*) FROM posts;") == before_replay, "forced restart retries create no new posts")
+        check(sql("SELECT * FROM outbox_events ORDER BY id;") == saved_events, "events survive forced restart and replay")
         passed("publication results survive forced application restart")
         stop_server()
         check(process.returncode == 0, "graceful shutdown")
         start_server()
+        check(sql("SELECT * FROM outbox_events ORDER BY id;") == saved_events, "events survive graceful restart")
         check(request("POST", post_path, retry_token, data=retry_content, status=201,
                       request_key="Concurrent-Key") == original_publication, "publication result survives graceful restart")
         check(request("GET", api + "/me", token)["id"] == actor, "session survives restart")

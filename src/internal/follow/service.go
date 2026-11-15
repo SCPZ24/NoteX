@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/SCPZ24/NoteX/src/internal/outbox"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -41,37 +42,21 @@ func (s *Service) Follow(ctx context.Context, actor, target int64) error {
 	if actor <= 0 || target <= 0 || actor == target {
 		return ErrInvalid
 	}
-	// The unique index arbitrates concurrent inserts. A retry leaves the original
-	// relationship ID and creation time unchanged. Foreign keys check both users.
-	err := s.execRelationship(ctx,
-		"INSERT INTO following (user_id, follow_id, created_on) VALUES (?, ?, ?)",
-		actor, target, time.Now().Unix())
-	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) {
-		switch mysqlErr.Number {
-		case 1062: // The only supplied unique value is the user pair; ID is generated.
-			return nil
-		case 1452:
-			return ErrUserNotFound
-		}
-	}
-	return err
+	return s.setFollowing(ctx, actor, target, true)
 }
 
 func (s *Service) Unfollow(ctx context.Context, actor, target int64) error {
 	if actor <= 0 || target <= 0 || actor == target {
 		return ErrInvalid
 	}
-	err := s.execRelationship(ctx,
-		"DELETE FROM following WHERE user_id = ? AND follow_id = ?", actor, target)
-	return err
+	return s.setFollowing(ctx, actor, target, false)
 }
 
-// Each call executes one autocommit statement. InnoDB rolls back the statement's
-// transaction on deadlock (1213), so that specific failure can be retried safely.
-func (s *Service) execRelationship(ctx context.Context, query string, args ...any) error {
+// InnoDB rolls back the entire transaction on deadlock (1213). Retry the
+// relationship change together with its event, using a new transaction.
+func (s *Service) setFollowing(ctx context.Context, actor, target int64, following bool) error {
 	for attempt := 0; attempt < 5; attempt++ {
-		_, err := s.db.ExecContext(ctx, query, args...)
+		err := s.writeRelationship(ctx, actor, target, following)
 		var mysqlErr *mysql.MySQLError
 		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1213 {
 			return err
@@ -88,6 +73,47 @@ func (s *Service) execRelationship(ctx context.Context, query string, args ...an
 		}
 	}
 	return ErrBusy
+}
+
+func (s *Service) writeRelationship(ctx context.Context, actor, target int64, following bool) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	createdOn := time.Now().Unix()
+	eventType := outbox.FollowDeleted
+	query := "DELETE FROM following WHERE user_id = ? AND follow_id = ?"
+	args := []any{actor, target}
+	if following {
+		eventType = outbox.FollowCreated
+		query = "INSERT INTO following (user_id, follow_id, created_on) VALUES (?, ?, ?)"
+		args = append(args, createdOn)
+	}
+	result, err := tx.ExecContext(ctx, query, args...)
+	var mysqlErr *mysql.MySQLError
+	if following && errors.As(err, &mysqlErr) {
+		switch mysqlErr.Number {
+		case 1062: // A repeated follow preserves the original relationship and event.
+			return nil
+		case 1452:
+			return ErrUserNotFound
+		}
+	}
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed > 0 {
+		if err := outbox.RecordFollow(ctx, tx, eventType, actor, target, createdOn); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Service) IsFollowing(ctx context.Context, actor, target int64) (bool, error) {

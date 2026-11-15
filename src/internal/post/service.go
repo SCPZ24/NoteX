@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/SCPZ24/NoteX/src/internal/outbox"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -109,6 +110,9 @@ func (s *Service) Create(ctx context.Context, actor int64, requestKey, content s
 	if err != nil {
 		return Post{}, err
 	}
+	if err := outbox.RecordPost(ctx, tx, outbox.PostCreated, actor, item.ID, createdOn); err != nil {
+		return Post{}, err
+	}
 	// A lost COMMIT reply can leave the outcome unknown to Go. Return the error
 	// and let the client retry with the same key to discover the durable result.
 	if err := tx.Commit(); err != nil {
@@ -155,9 +159,14 @@ func (s *Service) Delete(ctx context.Context, actor, id int64) error {
 	if actor <= 0 || id <= 0 {
 		return ErrInvalid
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	// Include deleted posts so the author can repeat a successful deletion.
 	var author int64
-	err := s.db.QueryRowContext(ctx, "SELECT author_id FROM posts WHERE id = ?", id).Scan(&author)
+	err = tx.QueryRowContext(ctx, "SELECT author_id FROM posts WHERE id = ?", id).Scan(&author)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -169,10 +178,23 @@ func (s *Service) Delete(ctx context.Context, actor, id int64) error {
 	}
 	// The author is immutable. The conditional update also preserves the first
 	// deletion timestamp when multiple delete requests execute concurrently.
-	_, err = s.db.ExecContext(ctx,
+	deletedOn := time.Now().Unix()
+	result, err := tx.ExecContext(ctx,
 		"UPDATE posts SET deleted_on = ? WHERE id = ? AND author_id = ? AND deleted_on IS NULL",
-		time.Now().Unix(), id, actor)
-	return err
+		deletedOn, id, actor)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed > 0 {
+		if err := outbox.RecordPost(ctx, tx, outbox.PostDeleted, actor, id, deletedOn); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Service) List(ctx context.Context, owner int64, after string, limit int) (Page, error) {

@@ -66,6 +66,9 @@ func (s *Service) Feed(ctx context.Context, actor int64, after string, limit int
 	if err := s.touchSources(cacheCtx, sources); err != nil {
 		return s.sqlPage(ctx, actor, after, limit, "redis", false)
 	}
+	if sources[0].state.signature != sources[0].signature && sources[0].state.signature != "pending" {
+		return s.sqlPage(ctx, actor, after, limit, "relationship_change", false)
+	}
 	cold := false
 	for _, source := range sources {
 		cold = cold || !source.state.ready
@@ -186,10 +189,10 @@ func (s *Service) sources(ctx context.Context, actor int64) ([]cacheSource, stri
 	if relations > 4096 {
 		return nil, "relationships", nil
 	}
-	if len(authors) > maxPullAuthors {
-		return nil, "sources", nil
-	}
 	sources := []cacheSource{{owner: actor, signature: fmt.Sprintf("%x", fingerprint.Sum(nil))}}
+	if len(authors) > maxPullAuthors {
+		return sources, "sources", nil
+	}
 	ids := make([]int64, 0, len(authors))
 	for id := range authors {
 		ids = append(ids, id)
@@ -262,6 +265,7 @@ func (s *Service) warmSource(ctx context.Context, source cacheSource) error {
 		}
 		values = append(values, member(item.entry), strconv.FormatInt(item.entry.ID, 10), relation)
 	}
+	values = append(values, source.signature)
 	applied, err := installCache.Run(ctx, s.redis, s.cacheKeys(source), values...).Int()
 	if err != nil {
 		return err

@@ -75,6 +75,9 @@ func (s *Service) handleRoot(ctx context.Context, event outbox.Event, publish fu
 	if err := s.Handle(ctx, event); err != nil {
 		return err
 	}
+	if event.Type == outbox.FollowCreated || event.Type == outbox.FollowDeleted {
+		return nil
+	}
 	var payload outbox.PostPayload
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return err

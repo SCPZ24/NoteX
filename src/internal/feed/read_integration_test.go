@@ -115,7 +115,7 @@ func verifyReading(t *testing.T, db *sql.DB, base *Service, redisURL, url, prefi
 			t.Fatal(err)
 		}
 		for _, source := range sources {
-			if !source.state.ready {
+			if !source.state.ready || source.state.signature != source.signature {
 				if err := s.warmSource(ctx, source); err != nil {
 					t.Fatal(err)
 				}
@@ -198,10 +198,18 @@ func verifyReading(t *testing.T, db *sql.DB, base *Service, redisURL, url, prefi
 	t.Run("refollow changes coverage identity and returns historical posts", func(t *testing.T) {
 		execute(t, "DELETE FROM following WHERE user_id=10000 AND follow_id=11001")
 		execute(t, "INSERT INTO following(user_id,follow_id,created_on) VALUES(10000,11001,1)")
-		before := hybrid.Stats()["sql_cold"]
+		before := hybrid.Stats()["sql_relationship_change"]
 		samePage(t, hybrid, 50)
-		if hybrid.Stats()["sql_cold"] != before+1 {
+		if hybrid.Stats()["sql_relationship_change"] != before+1 {
 			t.Fatal("old relationship coverage reused")
+		}
+		var relation int64
+		if err := db.QueryRow("SELECT id FROM following WHERE user_id=10000 AND follow_id=11001").Scan(&relation); err != nil {
+			t.Fatal(err)
+		}
+		payload, _ := json.Marshal(outbox.FollowPayload{ActorID: actor, TargetUserID: 11001, RelationID: relation})
+		if err := hybrid.Handle(ctx, outbox.Event{Type: outbox.FollowCreated, Payload: payload}); err != nil {
+			t.Fatal(err)
 		}
 		samePage(t, hybrid, 50)
 	})
@@ -399,6 +407,143 @@ func verifyReading(t *testing.T, db *sql.DB, base *Service, redisURL, url, prefi
 		}
 		if _, err := push.Feed(ctx, actor, "", 101); err != post.ErrInvalid {
 			t.Fatal("invalid limit accepted", err)
+		}
+	})
+
+	t.Run("20 relationship changes preserve members and fence late writes", func(t *testing.T) {
+		for round := 0; round < 20; round++ {
+			warmAll(t, push)
+			keys := push.cacheKeys(cacheSource{owner: actor})
+			generation := push.redis.HGet(ctx, keys[3], "generation").Val()
+			var relation int64
+			if err := db.QueryRow("SELECT id FROM following WHERE user_id=? AND follow_id=11066", actor).Scan(&relation); err != nil {
+				t.Fatal(err)
+			}
+			var entry Entry
+			if err := db.QueryRow("SELECT id,created_on FROM posts WHERE author_id=11066 ORDER BY id DESC LIMIT 1").Scan(&entry.ID, &entry.CreatedOn); err != nil {
+				t.Fatal(err)
+			}
+			targets := []recipient{{UserID: actor, RelationID: relation, generation: generation}}
+			before := push.redis.ZRange(ctx, keys[0], 0, -1).Val()
+			execute(t, "DELETE FROM following WHERE id=?", relation)
+			samePage(t, push, 50)
+			if !reflect.DeepEqual(before, push.redis.ZRange(ctx, keys[0], 0, -1).Val()) {
+				t.Fatal("immediate read changed pending index")
+			}
+			payload, _ := json.Marshal(outbox.FollowPayload{ActorID: actor, TargetUserID: 11066, RelationID: relation})
+			event := outbox.Event{Type: outbox.FollowDeleted, Payload: payload}
+			if err := push.Handle(ctx, event); err != nil {
+				t.Fatal(err)
+			}
+			if err := push.writeReaderBatch(ctx, entry, targets, false); err != nil {
+				t.Fatal(err)
+			}
+			if push.redis.ZScore(ctx, keys[0], member(entry)).Err() == nil {
+				t.Fatal("late writer restored removed relationship")
+			}
+			execute(t, "INSERT INTO following(user_id,follow_id,created_on) VALUES(?,11066,1)", actor)
+			samePage(t, push, 50)
+			if err := push.Handle(ctx, event); err != nil {
+				t.Fatal(err)
+			} // Old deletion reconciles current refollow.
+			samePage(t, push, 50)
+			if push.redis.HGet(ctx, keys[3], "generation").Val() != generation {
+				t.Fatal("relationship update reset cache lifecycle")
+			}
+			if push.redis.ZScore(ctx, keys[0], member(entry)).Err() != nil {
+				t.Fatal("old cleanup removed refollowed member")
+			}
+		}
+	})
+	t.Run("20 late relationship commits recover a frozen planner omission", func(t *testing.T) {
+		for round := 0; round < 20; round++ {
+			execute(t, "DELETE FROM following WHERE user_id=? AND follow_id=11066", actor)
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := tx.Exec("INSERT INTO following(user_id,follow_id,created_on) VALUES(?,11066,1)", actor)
+			if err != nil {
+				tx.Rollback()
+				t.Fatal(err)
+			}
+			relation, err := result.LastInsertId()
+			if err != nil {
+				tx.Rollback()
+				t.Fatal(err)
+			}
+			if err := outbox.RecordFollow(ctx, tx, outbox.FollowCreated, actor, 11066, relation, time.Now().Unix()); err != nil {
+				tx.Rollback()
+				t.Fatal(err)
+			}
+			item, err := post.New(db, nil).Create(ctx, 11066, fmt.Sprintf("late-follow-%d", round), "late relationship publication")
+			if err != nil {
+				tx.Rollback()
+				t.Fatal(err)
+			}
+			var root outbox.Event
+			if err := db.QueryRow("SELECT id,event_type,payload,created_on FROM outbox_events WHERE event_type='post.created' AND payload->>'$.post_id'=?", item.ID).Scan(&root.ID, &root.Type, &root.Payload, &root.CreatedOn); err != nil {
+				tx.Rollback()
+				t.Fatal(err)
+			}
+			var plan outbox.Event
+			if err := push.handleRoot(ctx, root, func(_ context.Context, event outbox.Event) error { plan = event; return nil }); err != nil {
+				tx.Rollback()
+				t.Fatal(err)
+			}
+			children, err := push.preparePage(ctx, plan)
+			if err != nil {
+				tx.Rollback()
+				t.Fatal(err)
+			}
+			for _, id := range children {
+				var raw []byte
+				if err := db.QueryRow("SELECT body FROM feed_tasks WHERE id=?", id).Scan(&raw); err != nil {
+					tx.Rollback()
+					t.Fatal(err)
+				}
+				var body taskBody
+				if err := json.Unmarshal(raw, &body); err != nil {
+					tx.Rollback()
+					t.Fatal(err)
+				}
+				for _, target := range body.Recipients {
+					if target.UserID == actor {
+						tx.Rollback()
+						t.Fatal("uncommitted relationship visible to planner")
+					}
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			samePage(t, push, 50)
+			payload, _ := json.Marshal(outbox.FollowPayload{ActorID: actor, TargetUserID: 11066, RelationID: relation})
+			if err := push.Handle(ctx, outbox.Event{Type: outbox.FollowCreated, Payload: payload}); err != nil {
+				t.Fatal(err)
+			}
+			if push.redis.ZScore(ctx, push.readerKeys(actor)[0], member(Entry{ID: item.ID, CreatedOn: item.CreatedOn})).Err() != nil {
+				t.Fatal("relationship reconciliation missed frozen recipient")
+			}
+			samePage(t, push, 50)
+		}
+	})
+	t.Run("trimming low IDs preserves unrelated relationship fields", func(t *testing.T) {
+		isolated := makeService(t, "trim-small-ids", "push", nil)
+		targets := []recipient{{UserID: actor, RelationID: 101}}
+		fixtureActiveReaders(t, isolated, targets)
+		for id := int64(1); id <= 501; id++ {
+			created := id
+			if id == 19 {
+				created = 100000
+			}
+			if err := isolated.writeReaderBatch(ctx, Entry{ID: id, CreatedOn: created}, targets, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		keys := isolated.readerKeys(actor)
+		if isolated.redis.HGet(ctx, keys[2], "19").Val() != "101" || isolated.redis.HLen(ctx, keys[2]).Val() != 500 {
+			t.Fatal("trim removed unrelated relationship field")
 		}
 	})
 	t.Run("real HTTP hybrid startup writes and reads both author strategies", func(t *testing.T) {

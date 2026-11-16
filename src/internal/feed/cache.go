@@ -26,6 +26,7 @@ type cacheSource struct {
 }
 type cacheState struct {
 	generation string
+	signature  string
 	ready      bool
 	floor      string
 	count      int
@@ -48,7 +49,8 @@ func (s *Service) cacheKeys(source cacheSource) []string {
 // A fresh generation atomically invalidates old workers before clearing data.
 var touchCache = redis.NewScript(`
 local gen=redis.call('HGET',KEYS[4],'generation')
-local valid=gen and redis.call('HGET',KEYS[4],'signature')==ARGV[1]
+local signature=redis.call('HGET',KEYS[4],'signature')
+local valid=gen and (ARGV[4]=='reader' or signature==ARGV[1])
 if valid and redis.call('HGET',KEYS[4],'ready')=='1' then
  local n=tonumber(redis.call('HGET',KEYS[4],'count') or '-1')
  valid=redis.call('ZCARD',KEYS[1])==n
@@ -60,7 +62,7 @@ if not valid then
  redis.call('HSET',KEYS[4],'generation',gen,'signature',ARGV[1],'ready','0','floor','','count','0','revision','0')
 end
 for _,key in ipairs(KEYS) do redis.call('PEXPIRE',key,ARGV[3]) end
-return {gen,redis.call('HGET',KEYS[4],'ready'),redis.call('HGET',KEYS[4],'floor'),redis.call('HGET',KEYS[4],'count'),redis.call('HGET',KEYS[4],'revision')}
+return {gen,redis.call('HGET',KEYS[4],'ready'),redis.call('HGET',KEYS[4],'floor'),redis.call('HGET',KEYS[4],'count'),redis.call('HGET',KEYS[4],'revision'),redis.call('HGET',KEYS[4],'signature')}
 `)
 
 func (s *Service) touchSources(ctx context.Context, sources []cacheSource) error {
@@ -102,6 +104,9 @@ func parseCacheState(values []any) (cacheState, error) {
 		return cacheState{}, fmt.Errorf("invalid cache metadata")
 	}
 	state := cacheState{generation: fmt.Sprint(values[0]), ready: fmt.Sprint(values[1]) == "1", floor: fmt.Sprint(values[2]), revision: fmt.Sprint(values[4])}
+	if len(values) > 5 {
+		state.signature = fmt.Sprint(values[5])
+	}
 	count, err := strconv.Atoi(fmt.Sprint(values[3]))
 	state.count = count
 	if err != nil || count < 0 || count > retainedPosts || state.generation == "" {
@@ -130,7 +135,7 @@ if ARGV[3]=='deleted' then
  redis.call('PEXPIRE',KEYS[2],ttl)
  redis.call('ZREM',KEYS[1],ARGV[2])
  redis.call('HDEL',KEYS[3],ARGV[1])
-elseif redis.call('SISMEMBER',KEYS[2],ARGV[1])==0 then
+elseif redis.call('SISMEMBER',KEYS[2],ARGV[1])==0 and redis.call('HEXISTS',KEYS[4],'blocked:'..ARGV[4])==0 then
  redis.call('ZADD',KEYS[1],0,ARGV[2])
  redis.call('PEXPIRE',KEYS[1],ttl)
  if ARGV[4]~='' then redis.call('HSET',KEYS[3],ARGV[1],ARGV[4]); redis.call('PEXPIRE',KEYS[3],ttl) end
@@ -140,7 +145,8 @@ if n>tonumber(ARGV[6]) then
  local removed=redis.call('ZRANGE',KEYS[1],0,n-tonumber(ARGV[6])-1)
  for _,value in ipairs(removed) do
   redis.call('ZREM',KEYS[1],value)
-  redis.call('HDEL',KEYS[3],string.gsub(string.sub(value,22),'^0+',''))
+  local id=string.gsub(string.sub(value,22),'^0+','')
+  redis.call('HDEL',KEYS[3],id)
  end
  local oldest=redis.call('ZRANGE',KEYS[1],0,0)[1]
  if oldest and oldest>floor then redis.call('HSET',KEYS[4],'floor',oldest) end
@@ -157,10 +163,19 @@ if redis.call('HGET',KEYS[4],'generation')~=ARGV[1] or redis.call('HGET',KEYS[4]
 local ttl=redis.call('PTTL',KEYS[4])
 if ttl<=0 then return 0 end
 local n=tonumber(ARGV[4])
-if not n or n<0 or n>500 or #ARGV~=4+n*3 then return redis.error_reply('invalid cache snapshot') end
+if not n or n<0 or n>500 or (#ARGV~=4+n*3 and #ARGV~=5+n*3) then return redis.error_reply('invalid cache snapshot') end
 redis.call('HSET',KEYS[4],'ready','0')
 redis.call('HINCRBY',KEYS[4],'revision',1)
-redis.call('DEL',KEYS[1],KEYS[3])
+local desired={}
+for i=0,n-1 do desired[ARGV[5+i*3]]=true end
+local old=redis.call('ZRANGE',KEYS[1],0,-1)
+for _,value in ipairs(old) do
+ if not desired[value] then
+  redis.call('ZREM',KEYS[1],value)
+  local id=string.gsub(string.sub(value,22),'^0+','')
+  redis.call('HDEL',KEYS[3],id)
+ end
+end
 for i=0,n-1 do
  local at=5+i*3
  redis.call('ZADD',KEYS[1],0,ARGV[at])
@@ -168,6 +183,7 @@ for i=0,n-1 do
  if ARGV[at+2]~='' then redis.call('HSET',KEYS[3],ARGV[at+1],ARGV[at+2]); if i==0 then redis.call('PEXPIRE',KEYS[3],ttl) end end
 end
 redis.call('HSET',KEYS[4],'floor',ARGV[3],'count',n,'ready','1')
+if #ARGV==5+n*3 then redis.call('HSET',KEYS[4],'signature',ARGV[5+n*3]) end
 for _,key in ipairs(KEYS) do redis.call('PEXPIRE',key,ttl) end
 return 1
 `)

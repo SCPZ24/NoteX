@@ -74,11 +74,11 @@ func New(db *sql.DB, redisURL, prefix, mode string, pullAuthors []int64) (*Servi
 func (s *Service) Close() error { return s.redis.Close() }
 
 // Handle reconciles a post's current authoritative state with its author index.
-// Relationship roots remain durably waiting until the fanout stage can handle them.
+// Relationship events reconcile the active reader index against current SQL.
 func (s *Service) Handle(ctx context.Context, event outbox.Event) error {
 	switch event.Type {
 	case outbox.FollowCreated, outbox.FollowDeleted:
-		return fmt.Errorf("%w: relationship projection awaits fanout stage", outbox.ErrWaiting)
+		return s.reconcileRelationship(ctx, event)
 	case outbox.PostCreated, outbox.PostDeleted:
 	default:
 		return fmt.Errorf("%w: unsupported feed event type", outbox.ErrPermanent)

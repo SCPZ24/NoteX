@@ -443,7 +443,9 @@ func TestAuthorIndexIntegration(t *testing.T) {
 			return service.redis.SIsMember(ctx, service.keys(1)[1], strconv.FormatInt(item.ID, 10)).Val() && !visible(item)
 		})
 		request("PUT", "/api/v1/users/2/follow", "", "", 200)
-		wait(t, "relationship retained waiting", 10*time.Second, func() bool { return count(t, "SELECT COUNT(*) FROM consumption_jobs WHERE status='waiting'") == 1 })
+		wait(t, "relationship completed", 10*time.Second, func() bool {
+			return count(t, "SELECT COUNT(*) FROM consumption_jobs WHERE consumer=? AND status='completed' AND body LIKE '%follow.created%'", prefix+".feed") == 1
+		})
 		if os.Getenv("NOTEX_REDIS_OUTAGE") != "1" {
 			return
 		}
@@ -462,6 +464,17 @@ func TestAuthorIndexIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		request("GET", "/readyz", "", "", 200)
+		var fallbackPage post.Page
+		if err := json.Unmarshal(request("GET", "/api/v1/feed", "", "", 200), &fallbackPage); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, candidate := range fallbackPage.Items {
+			found = found || candidate.ID == item.ID
+		}
+		if !found {
+			t.Fatal("HTTP SQL fallback missed committed publication during Redis outage")
+		}
 		var eventID int64
 		if err := db.QueryRow("SELECT id FROM outbox_events WHERE event_type='post.created' AND payload->>'$.post_id'=?", item.ID).Scan(&eventID); err != nil {
 			t.Fatal(err)
@@ -548,6 +561,9 @@ func TestAuthorIndexIntegration(t *testing.T) {
 
 	if os.Getenv("NOTEX_FANOUT_INTEGRATION") == "1" {
 		t.Run("stage four fanout", func(t *testing.T) { verifyFanout(t, db, service, url, prefix) })
+	}
+	if os.Getenv("NOTEX_SCALE_FOLLOWERS") != "" {
+		t.Run("F scale", func(t *testing.T) { verifyScale(t, db, service, url, prefix) })
 	}
 	if os.Getenv("NOTEX_READING_INTEGRATION") == "1" {
 		t.Run("stage five reading", func(t *testing.T) { verifyReading(t, db, service, redisURL, url, prefix) })

@@ -234,9 +234,12 @@ class Baseline:
             probe.bind(('127.0.0.1', 0))
             port = probe.getsockname()[1]
         self.base = f'http://127.0.0.1:{port}'
+        mode = getattr(self.args, 'mode', 'sql')
+        if mode != 'sql':
+            mq = True
         env = dict(os.environ, GOMAXPROCS='2', GOMEMLIMIT='512MiB', GIN_MODE='release',
                    HTTP_ADDR=f'127.0.0.1:{port}', MYSQL_DSN=f'{self.database}:{self.password}@tcp({self.host}:{self.port})/{self.database}',
-                   REDIS_URL='', FEED_MODE='sql', RABBITMQ_QUEUE_PREFIX='notex_dummy_' + self.database,
+                   REDIS_URL=os.getenv('TEST_REDIS_URL', 'redis://127.0.0.1:6380/0') if mode != 'sql' else '', FEED_MODE=mode, FEED_PULL_AUTHORS=','.join(str(i) for i in range(10, 74)), RABBITMQ_QUEUE_PREFIX='notex_dummy_' + self.database,
                    RABBITMQ_URL=os.getenv('TEST_RABBITMQ_URL', 'amqp://notex:notex-local@127.0.0.1:5673/') if mq else '')
         command = [str(Path(self.args.events_binary).resolve()), 'dummy'] if dummy else [str(Path(self.args.binary).resolve())]
         process = subprocess.Popen(command, env=env, stdout=self.logs, stderr=self.logs)

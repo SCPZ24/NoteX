@@ -32,7 +32,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 	}
 	router := httpapi.NewRouter(db.PingContext)
 	wake := make(chan struct{}, 1)
-	httpapi.RegisterAPI(router, account.New(db), follow.New(db, wake), post.New(db, wake))
+	posts := post.New(db, wake)
+	var reader httpapi.FeedReader = posts
 	if cfg.RabbitMQURL != "" {
 		workerCtx, cancelWorker := context.WithCancel(ctx)
 		workerDone := make(chan struct{})
@@ -46,13 +47,14 @@ func Run(ctx context.Context, cfg config.Config) error {
 			<-workerDone
 		}()
 	}
-	if cfg.RedisURL != "" {
-		projection, err := feed.New(db, cfg.RedisURL, cfg.QueuePrefix)
+	if cfg.FeedMode != "sql" && cfg.RedisURL != "" {
+		projection, err := feed.New(db, cfg.RedisURL, cfg.QueuePrefix, cfg.FeedMode, cfg.PullAuthors)
 		if err != nil {
 			listener.Close()
 			return err
 		}
 		defer projection.Close()
+		reader = projection
 		workerCtx, cancelWorker := context.WithCancel(ctx)
 		workerDone := make(chan struct{})
 		go func() {
@@ -66,6 +68,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 			<-workerDone
 		}()
 	}
+	httpapi.RegisterAPI(router, account.New(db), follow.New(db, wake), posts, reader)
 	server := &http.Server{
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,

@@ -89,6 +89,11 @@ func verifyFanout(t *testing.T, db *sql.DB, s *Service, url, prefix string) {
 		execute(t, "INSERT INTO users(id,username,password_hash,created_on) VALUES"+strings.Join(users, ","))
 		execute(t, "INSERT INTO following(user_id,follow_id,created_on) VALUES"+strings.Join(relations, ","))
 	}
+	activeReaders := []recipient{{UserID: 3000}}
+	for id := int64(4001); id <= 5203; id++ {
+		activeReaders = append(activeReaders, recipient{UserID: id})
+	}
+	fixtureActiveReaders(t, s, activeReaders)
 	publisher := outbox.NewTaskPublisher(url, prefix)
 	defer publisher.Close()
 	observer := &pipelineObserver{}
@@ -320,6 +325,7 @@ func verifyFanout(t *testing.T, db *sql.DB, s *Service, url, prefix string) {
 		}
 		for round := 0; round < 20; round++ {
 			isolated := &Service{db: db, redis: s.redis, prefix: fmt.Sprintf("%s:partial:%d", prefix, round)}
+			fixtureActiveReaders(t, isolated, current.Body.Recipients)
 			broken := isolated.readerKeys(current.Body.Recipients[0].UserID)[0]
 			if err := s.redis.Set(ctx, broken, "wrong type", 0).Err(); err != nil {
 				t.Fatal(err)
@@ -412,6 +418,7 @@ func verifyFanout(t *testing.T, db *sql.DB, s *Service, url, prefix string) {
 		for round := 0; round < 20; round++ {
 			isolated := &Service{db: db, redis: s.redis, prefix: fmt.Sprintf("%s:deletion:%d", prefix, round)}
 			entry := Entry{ID: item.ID, CreatedOn: item.CreatedOn}
+			fixtureActiveReaders(t, isolated, targets)
 			if err := isolated.writeReaderBatch(ctx, entry, targets, false); err != nil {
 				t.Fatal(err)
 			}

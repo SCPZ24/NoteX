@@ -9,25 +9,7 @@ import (
 	"strings"
 
 	"github.com/SCPZ24/NoteX/src/internal/outbox"
-	"github.com/redis/go-redis/v9"
 )
-
-// All keys share a reader hash tag. Relationship identity is retained for later
-// lifecycle-specific cleanup. Each script affects exactly one reader/post pair.
-var updateReader = redis.NewScript(`
-if ARGV[3] == 'deleted' then
- redis.call('SADD', KEYS[2], ARGV[1])
- redis.call('ZREM', KEYS[1], ARGV[2])
- redis.call('HDEL', KEYS[3], ARGV[1])
- return 1
-end
-if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then
- return 0
-end
-redis.call('ZADD', KEYS[1], 0, ARGV[2])
-redis.call('HSET', KEYS[3], ARGV[1], ARGV[4])
-return 1
-`)
 
 func (s *Service) readerKeys(reader int64) []string {
 	base := fmt.Sprintf("%s:reader:{%d}", s.prefix, reader)
@@ -43,6 +25,9 @@ func (s *Service) distribute(ctx context.Context, event outbox.Event) error {
 	if current.Kind != "feed.chunk" || len(targets) == 0 || len(targets) > chunkSize {
 		return fmt.Errorf("%w: invalid distribution chunk", outbox.ErrPermanent)
 	}
+	if err := s.readerGenerations(ctx, targets); err != nil {
+		return err
+	}
 	var entry Entry
 	var author int64
 	var deleted sql.NullInt64
@@ -53,6 +38,9 @@ func (s *Service) distribute(ctx context.Context, event outbox.Event) error {
 	}
 	if err != nil {
 		return err
+	}
+	if s.pullAuthors[author] {
+		return nil
 	}
 	if author <= 0 || entry.ID <= 0 || entry.CreatedOn <= 0 {
 		return fmt.Errorf("%w: invalid distribution post", outbox.ErrPermanent)
@@ -116,29 +104,16 @@ func (s *Service) writeReaderBatch(ctx context.Context, entry Entry, targets []r
 	if deleted {
 		state = "deleted"
 	}
-	args := func(target recipient) []any {
-		return []any{strconv.FormatInt(entry.ID, 10), member(entry), state, strconv.FormatInt(target.RelationID, 10)}
-	}
-	pipe := s.redis.Pipeline()
-	commands := make([]*redis.Cmd, 0, len(targets))
+	calls := make([]scriptCall, 0, len(targets))
 	for _, target := range targets {
-		commands = append(commands, updateReader.EvalSha(ctx, pipe, s.readerKeys(target.UserID), args(target)...))
-	}
-	_, err := pipe.Exec(ctx)
-	if err != nil && !redis.HasErrorPrefix(err, "NOSCRIPT") {
-		return err
-	}
-	fallback := s.redis.Pipeline()
-	for i, command := range commands {
-		if redis.HasErrorPrefix(command.Err(), "NOSCRIPT") {
-			updateReader.Eval(ctx, fallback, s.readerKeys(targets[i].UserID), args(targets[i])...)
-		} else if command.Err() != nil {
-			return command.Err()
+		if target.generation == "" {
+			continue
 		}
+		calls = append(calls, scriptCall{s.cacheKeys(cacheSource{owner: target.UserID}), []any{strconv.FormatInt(entry.ID, 10), member(entry), state, strconv.FormatInt(target.RelationID, 10), target.generation, retainedPosts}})
 	}
-	if fallback.Len() > 0 {
-		_, err = fallback.Exec(ctx)
-		return err
+	if len(calls) == 0 {
+		return nil
 	}
-	return nil
+	_, err := s.scriptBatch(ctx, cacheUpdate, calls)
+	return err
 }

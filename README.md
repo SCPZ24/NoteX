@@ -22,12 +22,14 @@ mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0002_posts
 mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0003_post_requests.sql
 mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0004_outbox_events.sql
 mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0005_event_consumption.sql
+mysql --host=127.0.0.1 --port=3306 --user=notex -p notex < migrations/0006_feed_tasks.sql
 ```
 
 第一份迁移创建 `users`、`sessions`、`following` 三张表，第二份迁移创建 `posts` 表。
 第三份迁移创建 `post_requests` 表，保存发布请求标识和首次响应。发布接口要求携带 `Idempotency-Key`。
 第四份迁移创建 `outbox_events` 表，包含投递状态、重试信息和扫描索引。升级后的发布、删除和关系变更会在业务事务内记录事件。
 第五份迁移创建消费任务、显式重放记录和 Dummy 测试效果表。
+第六份迁移创建 Feed Planner、分块与后继任务表。
 帖子建表语句同时创建个人列表索引和有效帖全局时间索引。
 新数据库按编号依次执行，已有数据库从尚未执行的迁移继续。
 已有 Paopao 的 `p_*` 表和账号需要另行迁移。本 SQL 由维护者手工执行，成功后应记录执行版本。
@@ -52,6 +54,23 @@ Compose 提供本机 RabbitMQ，AMQP 端口为 5673，管理端口为 15673，�
 `RABBITMQ_QUEUE_PREFIX` 默认 `notex`，生成 `notex.feed` 与 `notex.search` 两个持久化队列。
 后台任务由提交后的 Channel 通知唤醒，同时在启动及每 5 秒恢复扫描。
 MQ 暂时不可用时，投递失败信息和重试时间保存在数据库中，HTTP 写入继续使用业务事务。
+
+### Feed 运行模式
+
+`FEED_MODE=sql` 为默认值，保留完全 MySQL 排序读取。启用纯推或混合模式时，执行完六份迁移后使用以下配置。
+
+```bash
+docker compose up -d rabbitmq redis
+export REDIS_URL='redis://127.0.0.1:6380/0'
+export FEED_MODE=hybrid
+export FEED_PULL_AUTHORS='42,108'
+go run ./src
+```
+
+示例沿用前面设置的 MySQL 和 RabbitMQ 连接。将 `FEED_MODE` 设置为 `push` 即可使用纯推读取。
+拉取作者名单每轮启动时冻结，示例 ID 应替换为本轮数据中的作者。
+混合读取上限为 64 位拉取作者加一个读者索引，活动期为 7 天，每个索引保留 500 条。
+SQL 历史路径、冷缓存重建与接口兼容性见 [阶段五说明](notes/fanout/05-reading.md)。
 
 ### 投递验证
 

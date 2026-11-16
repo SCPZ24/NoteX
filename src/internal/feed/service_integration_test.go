@@ -95,7 +95,7 @@ func TestAuthorIndexIntegration(t *testing.T) {
 	if redisURL == "" {
 		redisURL = "redis://127.0.0.1:6380/0"
 	}
-	service, err := New(db, redisURL, prefix)
+	service, err := New(db, redisURL, prefix, "push", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestAuthorIndexIntegration(t *testing.T) {
 		entries := []Entry{{ID: 9007199254740993, CreatedOn: 1700000000}, {ID: 9007199254740992, CreatedOn: 1700000000}, {ID: 9223372036854775807, CreatedOn: 1700000001}}
 		for _, entry := range entries {
 			for range 2 {
-				if err := service.apply(ctx, 10, entry, false); err != nil {
+				if err := service.apply(ctx, 10, entry, false, fixtureAuthorGeneration(t, service, 10)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -260,13 +260,13 @@ func TestAuthorIndexIntegration(t *testing.T) {
 	t.Run("20 late adds cannot resurrect deleted posts", func(t *testing.T) {
 		for round := range 20 {
 			entry := Entry{ID: int64(round + 1), CreatedOn: 1700000000}
-			if err := service.apply(ctx, 20, entry, false); err != nil {
+			if err := service.apply(ctx, 20, entry, false, fixtureAuthorGeneration(t, service, 20)); err != nil {
 				t.Fatal(err)
 			}
-			if err := service.apply(ctx, 20, entry, true); err != nil {
+			if err := service.apply(ctx, 20, entry, true, fixtureAuthorGeneration(t, service, 20)); err != nil {
 				t.Fatal(err)
 			}
-			if err := service.apply(ctx, 20, entry, false); err != nil {
+			if err := service.apply(ctx, 20, entry, false, fixtureAuthorGeneration(t, service, 20)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -377,7 +377,7 @@ func TestAuthorIndexIntegration(t *testing.T) {
 		execute(t, "INSERT INTO sessions(token_hash,user_id,expires_on) VALUES(?,?,?)", hash[:], 1, time.Now().Add(time.Hour).Unix())
 		worker := exec.Command(binary)
 		worker.Env = append(os.Environ(), "MYSQL_DSN="+cfg.FormatDSN(), "HTTP_ADDR="+address, "RABBITMQ_URL="+url,
-			"RABBITMQ_QUEUE_PREFIX="+prefix, "REDIS_URL="+redisURL, "GOMAXPROCS=2", "GOMEMLIMIT=512MiB", "GIN_MODE=release")
+			"RABBITMQ_QUEUE_PREFIX="+prefix, "REDIS_URL="+redisURL, "FEED_MODE=push", "FEED_PULL_AUTHORS=", "GOMAXPROCS=2", "GOMEMLIMIT=512MiB", "GIN_MODE=release")
 		var output bytes.Buffer
 		worker.Stdout, worker.Stderr = &output, &output
 		if err := worker.Start(); err != nil {
@@ -427,6 +427,7 @@ func TestAuthorIndexIntegration(t *testing.T) {
 			}
 			return result
 		}
+		request("GET", "/api/v1/feed", "", "", 200)
 		var item post.Post
 		publishedAt := time.Now()
 		if err := json.Unmarshal(request("POST", "/api/v1/posts", "http-post", `{"content":"HTTP projection"}`, 201), &item); err != nil {
@@ -548,9 +549,43 @@ func TestAuthorIndexIntegration(t *testing.T) {
 	if os.Getenv("NOTEX_FANOUT_INTEGRATION") == "1" {
 		t.Run("stage four fanout", func(t *testing.T) { verifyFanout(t, db, service, url, prefix) })
 	}
+	if os.Getenv("NOTEX_READING_INTEGRATION") == "1" {
+		t.Run("stage five reading", func(t *testing.T) { verifyReading(t, db, service, redisURL, url, prefix) })
+	}
 }
 
 // Capture the actual injected finish error, independent of reconnect timing.
 type testLogWriter func([]byte) (int, error)
 
 func (w testLogWriter) Write(body []byte) (int, error) { return w(body) }
+
+func fixtureAuthorGeneration(t *testing.T, s *Service, author int64) string {
+	t.Helper()
+	sources := []cacheSource{{owner: author, author: true, signature: s.policy}}
+	if err := s.touchSources(context.Background(), sources); err != nil {
+		t.Fatal(err)
+	}
+	return sources[0].state.generation
+}
+
+// Stage-four fixtures explicitly establish active empty reader caches before
+// publication; cold/ready initialization itself is covered by stage-five tests.
+func fixtureActiveReaders(t *testing.T, s *Service, targets []recipient) {
+	t.Helper()
+	ctx := context.Background()
+	sources := make([]cacheSource, 0, len(targets))
+	for _, target := range targets {
+		sources = append(sources, cacheSource{owner: target.UserID, signature: s.policy})
+	}
+	if err := s.touchSources(ctx, sources); err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range sources {
+		if err := s.redis.HSet(ctx, s.cacheKeys(source)[3], "ready", "1").Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.readerGenerations(ctx, targets); err != nil {
+		t.Fatal(err)
+	}
+}

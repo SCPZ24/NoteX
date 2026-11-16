@@ -37,11 +37,17 @@ type handlers struct {
 	accounts *account.Service
 	follows  *follow.Service
 	posts    *post.Service
+	feed     FeedReader
+}
+
+// FeedReader is implemented by both the SQL baseline and the Redis-backed Feed.
+type FeedReader interface {
+	Feed(context.Context, int64, string, int) (post.Page, error)
 }
 
 // RegisterAPI leaves the existing health routes available without authentication.
-func RegisterAPI(router *gin.Engine, accounts *account.Service, follows *follow.Service, posts *post.Service) {
-	h := &handlers{accounts: accounts, follows: follows, posts: posts}
+func RegisterAPI(router *gin.Engine, accounts *account.Service, follows *follow.Service, posts *post.Service, reader FeedReader) {
+	h := &handlers{accounts: accounts, follows: follows, posts: posts, feed: reader}
 	api := router.Group("/api/v1")
 	api.Use(func(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)

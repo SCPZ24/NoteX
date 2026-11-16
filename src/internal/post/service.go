@@ -237,7 +237,7 @@ func (s *Service) list(ctx context.Context, owner int64, kind, after string, lim
 		args = []any{owner}
 	}
 	if after != "" {
-		boundary, err := decodeCursor(after, owner, kind)
+		boundary, err := DecodeCursor(after, owner, kind)
 		if err != nil {
 			return page, err
 		}
@@ -273,10 +273,44 @@ func (s *Service) list(ctx context.Context, owner int64, kind, after string, lim
 		page.HasMore = true
 		page.Items = page.Items[:limit]
 		last := page.Items[len(page.Items)-1]
-		page.NextCursor, err = encodeCursor(cursor{Owner: owner, Kind: kind, CreatedOn: last.CreatedOn, ID: last.ID})
+		page.NextCursor, err = EncodeCursor(Cursor{Owner: owner, Kind: kind, CreatedOn: last.CreatedOn, ID: last.ID})
 		if err != nil {
 			return page, err
 		}
 	}
 	return page, nil
+}
+
+// FeedCandidates loads a bounded set of Redis candidates against current SQL
+// relationships and deletion state. It returns only authoritative visible posts.
+func (s *Service) FeedCandidates(ctx context.Context, actor int64, ids []int64, limit int) ([]Post, error) {
+	if actor <= 0 || len(ids) == 0 || len(ids) > 256 || limit < 1 || limit > 101 {
+		return nil, ErrInvalid
+	}
+	placeholders := make([]string, len(ids))
+	args := []any{actor, actor}
+	for i, id := range ids {
+		if id <= 0 {
+			return nil, ErrInvalid
+		}
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT p.id,u.id,u.username,p.content,p.created_on FROM posts p JOIN users u ON u.id=p.author_id
+ WHERE p.deleted_on IS NULL AND (p.author_id=? OR EXISTS(SELECT 1 FROM following f WHERE f.user_id=? AND f.follow_id=p.author_id))
+ AND p.id IN (`+strings.Join(placeholders, ",")+`) ORDER BY p.created_on DESC,p.id DESC LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]Post, 0, len(ids))
+	for rows.Next() {
+		var item Post
+		if err := rows.Scan(&item.ID, &item.Author.ID, &item.Author.Username, &item.Content, &item.CreatedOn); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }

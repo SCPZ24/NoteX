@@ -21,6 +21,7 @@ const (
 type recipient struct {
 	UserID     int64 `json:"user_id"`
 	RelationID int64 `json:"relation_id"`
+	generation string
 }
 
 type taskBody struct {
@@ -77,6 +78,15 @@ func (s *Service) handleRoot(ctx context.Context, event outbox.Event, publish fu
 	var payload outbox.PostPayload
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return err
+	}
+	if s.mode == "hybrid" {
+		var author int64
+		if err := s.db.QueryRowContext(ctx, "SELECT author_id FROM posts WHERE id=?", payload.PostID).Scan(&author); err != nil {
+			return err
+		}
+		if s.pullAuthors[author] {
+			return nil
+		}
 	}
 	body, err := json.Marshal(taskBody{PostID: payload.PostID})
 	if err != nil {

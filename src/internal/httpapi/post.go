@@ -89,7 +89,7 @@ func (h *handlers) listFeed(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	page, err := h.posts.Feed(c.Request.Context(), currentUser(c).ID, c.Query("cursor"), limit)
+	page, err := h.feed.Feed(c.Request.Context(), currentUser(c).ID, c.Query("cursor"), limit)
 	if err != nil {
 		writeError(c, err)
 		return

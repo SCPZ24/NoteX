@@ -236,7 +236,7 @@ class Baseline:
         self.base = f'http://127.0.0.1:{port}'
         env = dict(os.environ, GOMAXPROCS='2', GOMEMLIMIT='512MiB', GIN_MODE='release',
                    HTTP_ADDR=f'127.0.0.1:{port}', MYSQL_DSN=f'{self.database}:{self.password}@tcp({self.host}:{self.port})/{self.database}',
-                   REDIS_URL='', RABBITMQ_QUEUE_PREFIX='notex_dummy_' + self.database,
+                   REDIS_URL='', FEED_MODE='sql', RABBITMQ_QUEUE_PREFIX='notex_dummy_' + self.database,
                    RABBITMQ_URL=os.getenv('TEST_RABBITMQ_URL', 'amqp://notex:notex-local@127.0.0.1:5673/') if mq else '')
         command = [str(Path(self.args.events_binary).resolve()), 'dummy'] if dummy else [str(Path(self.args.binary).resolve())]
         process = subprocess.Popen(command, env=env, stdout=self.logs, stderr=self.logs)

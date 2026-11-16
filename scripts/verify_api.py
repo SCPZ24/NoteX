@@ -133,7 +133,7 @@ def main():
     def start_server():
         nonlocal process
         env = dict(os.environ, GOMAXPROCS="2", GOMEMLIMIT="512MiB", GIN_MODE="release",
-                   RABBITMQ_URL="", REDIS_URL="",
+                   RABBITMQ_URL="", REDIS_URL="", FEED_MODE="sql",
                    HTTP_ADDR=f"127.0.0.1:{http_port}",
                    MYSQL_DSN=f"{database}:{db_password}@tcp({host}:{port})/{database}")
         process = subprocess.Popen([binary], env=env, stdout=log, stderr=log)

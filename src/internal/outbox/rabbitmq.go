@@ -17,12 +17,13 @@ const operationTimeout = 5 * time.Second
 // ponytail: serial confirms bound memory. Add a bounded in-flight window if
 // measured throughput requires concurrent publishing.
 type broker struct {
-	url      string
-	prefix   string
-	socket   net.Conn
-	channel  *amqp.Channel
-	confirms <-chan amqp.Confirmation
-	returns  <-chan amqp.Return
+	extraQueues []string
+	url         string
+	prefix      string
+	socket      net.Conn
+	channel     *amqp.Channel
+	confirms    <-chan amqp.Confirmation
+	returns     <-chan amqp.Return
 }
 
 func (b *broker) close() {
@@ -65,7 +66,8 @@ func (b *broker) connect(ctx context.Context) error {
 	channel, err := connection.Channel()
 	if err == nil {
 		b.channel = channel
-		for _, queue := range []string{b.prefix + ".feed", b.prefix + ".search"} {
+		for _, name := range append([]string{"feed", "search"}, b.extraQueues...) {
+			queue := b.prefix + "." + name
 			_, err = channel.QueueDeclare(queue, true, false, false, false, amqp.Table{"x-queue-type": "classic"})
 			if err != nil {
 				break

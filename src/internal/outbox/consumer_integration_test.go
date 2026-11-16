@@ -75,7 +75,7 @@ func TestConsumerIntegration(t *testing.T) {
 		return result
 	}
 	migrations, err := filepath.Glob("../../../migrations/*.sql")
-	if err != nil || len(migrations) != 5 {
+	if err != nil || len(migrations) != 6 {
 		t.Fatalf("migration inventory: %v %v", migrations, err)
 	}
 	for _, path := range migrations {

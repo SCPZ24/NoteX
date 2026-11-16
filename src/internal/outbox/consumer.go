@@ -39,6 +39,9 @@ func RunConsumer(ctx context.Context, db *sql.DB, url, prefix, name string, hand
 
 func runConsumer(ctx context.Context, db *sql.DB, url, prefix, name string, process func(context.Context, int64) error) error {
 	b := &broker{url: url, prefix: prefix}
+	if name == "feed.plan" || name == "feed.chunk" {
+		b.extraQueues = []string{name}
+	}
 	defer b.close()
 	consumer := prefix + "." + name
 	ticker := time.NewTicker(pollInterval)

@@ -136,14 +136,25 @@ func TestAuthorIndexIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, suffix := range []string{".feed", ".search"} {
+	for _, suffix := range []string{".feed", ".search", ".feed.plan", ".feed.chunk"} {
 		if _, err := channel.QueueDeclare(prefix+suffix, true, false, false, false, amqp.Table{"x-queue-type": "classic"}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	defer func() {
-		for _, suffix := range []string{".feed", ".search"} {
-			if _, err := channel.QueueDelete(prefix+suffix, false, false, false); err != nil {
+		cleanupConnection, err := amqp.Dial(url)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer cleanupConnection.Close()
+		cleanupChannel, err := cleanupConnection.Channel()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		for _, suffix := range []string{".feed", ".search", ".feed.plan", ".feed.chunk"} {
+			if _, err := cleanupChannel.QueueDelete(prefix+suffix, false, false, false); err != nil {
 				t.Error(err)
 			}
 		}
@@ -422,6 +433,9 @@ func TestAuthorIndexIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		wait(t, "HTTP post indexed", 10*time.Second, func() bool { return visible(item) })
+		wait(t, "HTTP post delivered to own reader index", 10*time.Second, func() bool {
+			return service.redis.ZScore(ctx, service.readerKeys(1)[0], member(Entry{ID: item.ID, CreatedOn: item.CreatedOn})).Err() == nil
+		})
 		t.Logf("HTTP request to observed author index visibility %.3f ms (20ms polling)", float64(time.Since(publishedAt).Microseconds())/1000)
 		request("DELETE", fmt.Sprintf("/api/v1/posts/%d", item.ID), "", "", 200)
 		wait(t, "HTTP deletion indexed", 10*time.Second, func() bool {
@@ -531,6 +545,9 @@ func TestAuthorIndexIntegration(t *testing.T) {
 		t.Logf("author=1 active_posts=%d index_bytes=%d deletion_marker_bytes=%d", len(actual), indexBytes, markerBytes)
 	})
 
+	if os.Getenv("NOTEX_FANOUT_INTEGRATION") == "1" {
+		t.Run("stage four fanout", func(t *testing.T) { verifyFanout(t, db, service, url, prefix) })
+	}
 }
 
 // Capture the actual injected finish error, independent of reconnect timing.

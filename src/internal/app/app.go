@@ -57,7 +57,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 		workerDone := make(chan struct{})
 		go func() {
 			defer close(workerDone)
-			if err := outbox.RunExternalConsumer(workerCtx, db, cfg.RabbitMQURL, cfg.QueuePrefix, "feed", projection.Handle); err != nil {
+			if err := projection.Run(workerCtx, cfg.RabbitMQURL); err != nil {
 				slog.Error("feed consumer stopped", "error", err)
 			}
 		}()

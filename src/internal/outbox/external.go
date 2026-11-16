@@ -21,8 +21,8 @@ const externalLease = 30 * time.Second
 // RunExternalConsumer shares MQ receipt, quarantine and ACK handling with the
 // SQL consumer, but claims and finishes external work in separate transactions.
 func RunExternalConsumer(ctx context.Context, db *sql.DB, url, prefix, name string, handler ExternalHandler) error {
-	if (name != "feed" && name != "search") || handler == nil {
-		return errors.New("external consumer requires feed/search and a handler")
+	if (name != "feed" && name != "search" && name != "feed.plan" && name != "feed.chunk") || handler == nil {
+		return errors.New("external consumer requires a supported queue and a handler")
 	}
 	return runConsumer(ctx, db, url, prefix, name, func(ctx context.Context, id int64) error {
 		return processExternal(ctx, db, prefix+"."+name, id, handler)

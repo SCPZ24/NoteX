@@ -95,6 +95,14 @@ func pending(ctx context.Context, db *sql.DB) ([]Event, error) {
 
 func (e Event) destinations(prefix string) ([]string, error) {
 	switch e.Type {
+	case "feed.plan", "feed.chunk":
+		var payload struct {
+			TaskID int64 `json:"task_id"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.TaskID <= 0 || payload.TaskID != e.ID {
+			return nil, errors.New("invalid Feed task identity")
+		}
+		return []string{prefix + "." + e.Type}, nil
 	case PostCreated, PostDeleted:
 		var payload PostPayload
 		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.PostID <= 0 {

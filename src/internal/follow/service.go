@@ -87,12 +87,24 @@ func (s *Service) writeRelationship(ctx context.Context, actor, target int64, fo
 
 	createdOn := time.Now().Unix()
 	eventType := outbox.FollowDeleted
-	query := "DELETE FROM following WHERE user_id = ? AND follow_id = ?"
-	args := []any{actor, target}
+	var relationID int64
+	if !following {
+		err := tx.QueryRowContext(ctx,
+			"SELECT id FROM following WHERE user_id = ? AND follow_id = ? FOR UPDATE",
+			actor, target).Scan(&relationID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return tx.Commit()
+		}
+		if err != nil {
+			return err
+		}
+	}
+	query := "DELETE FROM following WHERE id = ?"
+	args := []any{relationID}
 	if following {
 		eventType = outbox.FollowCreated
 		query = "INSERT INTO following (user_id, follow_id, created_on) VALUES (?, ?, ?)"
-		args = append(args, createdOn)
+		args = []any{actor, target, createdOn}
 	}
 	result, err := tx.ExecContext(ctx, query, args...)
 	var mysqlErr *mysql.MySQLError
@@ -112,7 +124,13 @@ func (s *Service) writeRelationship(ctx context.Context, actor, target int64, fo
 		return err
 	}
 	if changed > 0 {
-		if err := outbox.RecordFollow(ctx, tx, eventType, actor, target, createdOn); err != nil {
+		if following {
+			relationID, err = result.LastInsertId()
+			if err != nil {
+				return err
+			}
+		}
+		if err := outbox.RecordFollow(ctx, tx, eventType, actor, target, relationID, createdOn); err != nil {
 			return err
 		}
 	}

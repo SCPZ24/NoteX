@@ -32,6 +32,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--report", default="/tmp/notex-api-verification.json")
+    parser.add_argument("--concurrency", type=int, choices=range(1, 9), default=8)
     args = parser.parse_args()
     binary = str(Path(args.binary).resolve())
     host = os.getenv("TEST_MYSQL_HOST", "127.0.0.1")
@@ -44,7 +45,7 @@ def main():
     process = None
     log = tempfile.TemporaryFile(mode="w+")
     report = {"kind": "functional", "cases": [], "database": database,
-              "concurrency": 8, "cleanup": False, "peak_new_process_rss_kib": 0,
+              "concurrency": args.concurrency, "cleanup": False, "peak_new_process_rss_kib": 0,
               "peak_mysql_rss_kib": 0}
     stop_monitor = threading.Event()
     resource_error = []
@@ -132,7 +133,7 @@ def main():
     def start_server():
         nonlocal process
         env = dict(os.environ, GOMAXPROCS="2", GOMEMLIMIT="512MiB", GIN_MODE="release",
-                   RABBITMQ_URL="",
+                   RABBITMQ_URL="", REDIS_URL="",
                    HTTP_ADDR=f"127.0.0.1:{http_port}",
                    MYSQL_DSN=f"{database}:{db_password}@tcp({host}:{port})/{database}")
         process = subprocess.Popen([binary], env=env, stdout=log, stderr=log)
@@ -223,7 +224,7 @@ def main():
         check(deletion != "NULL", "durable deletion marker")
         # A fixed old value makes timestamp rewrites detectable even within one second.
         sql(f"UPDATE posts SET deleted_on=1000 WHERE id={created['id']};")
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             list(pool.map(lambda _: request("DELETE", deleted_path, token), range(16)))
         check(sql(f"SELECT deleted_on FROM posts WHERE id={created['id']};") == "1000",
               "repeated deletion preserves timestamp")
@@ -292,12 +293,12 @@ def main():
         request("PUT", relation(target), status=401, code="unauthorized")
         request("PUT", relation(target), token, data={"user_id": users[2]["id"]})
         snapshot = sql(f"SELECT id, created_on FROM following WHERE user_id={actor} AND follow_id={target};")
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             results = list(pool.map(lambda _: request("PUT", relation(target), token), range(16)))
         check(all(r == {"is_following": True} for r in results), "duplicate follow responses")
         check(sql(f"SELECT id, created_on FROM following WHERE user_id={actor} AND follow_id={target};") == snapshot, "duplicate preserved ID and time")
         check(sql("SELECT COUNT(*) FROM following;") == "1", "only authenticated actor writes")
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             list(pool.map(lambda _: request("DELETE", relation(target), token), range(16)))
         check(request("GET", relation(target), token) == {"is_following": False}, "duplicate unfollow")
         request("PUT", relation(target), token)
@@ -364,7 +365,7 @@ def main():
         check([i["user_id"] for i in second["items"]] == expected_out[2:4], "deleted boundary continuation")
         check(page("following")["items"][0]["user_id"] == users[6]["id"], "refresh finds new relation")
         passed("deleted cursor boundary and insertion between pages")
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             list(pool.map(lambda i: request("PUT" if i % 2 else "DELETE", relation(target), token), range(16)))
         state = int(sql(f"SELECT COUNT(*) FROM following WHERE user_id={actor} AND follow_id={target};"))
         check(state in (0, 1), "mixed operations unique state")
@@ -502,7 +503,7 @@ def main():
                     request_key=invalid_key, status=400, code="invalid_input")
         check(sql(f"SELECT COUNT(*) FROM post_requests WHERE user_id={retry_user['id']};") == "0",
               "invalid keys create no request records")
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             retry_results = list(pool.map(lambda _: request(
                 "POST", post_path, retry_token, data=retry_content, status=201,
                 request_key="Concurrent-Key"), range(16)))
@@ -512,11 +513,11 @@ def main():
               "concurrent retries create exactly one post")
         check(sql(f"SELECT COUNT(*) FROM post_requests WHERE user_id={retry_user['id']};") == "1",
               "concurrent retries create exactly one request record")
-        publication_event = sql("SELECT id, event_type, payload->>'$.actor_id', payload->>'$.post_id' "
+        publication_event = sql("SELECT id, event_type, payload->>'$.post_id' "
                                 f"FROM outbox_events WHERE payload->>'$.post_id'={original_publication['id']};")
         event_fields = publication_event.split()
-        check(len(event_fields) == 4 and event_fields[1:] == [
-            "post.created", str(retry_user["id"]), str(original_publication["id"])],
+        check(len(event_fields) == 3 and event_fields[1:] == [
+            "post.created", str(original_publication["id"])],
             "concurrent publication creates one identifiable event")
         check(request("POST", post_path, retry_token, data={"content": "  并发发布 🌱\n"}, status=201,
                       request_key="Concurrent-Key") == original_publication, "normalized content replays")
@@ -594,7 +595,7 @@ def main():
         passed("relationship deadlock retry includes business change and event")
 
         request("POST", post_path, retry_token, data=retry_content, request_key="outbox-rollback", status=201)
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             list(pool.map(lambda _: request("DELETE", post_path + f"/{outbox_post['id']}", retry_token), range(16)))
             list(pool.map(lambda _: request("PUT", relation(absent_target), retry_token), range(16)))
             list(pool.map(lambda _: request("DELETE", relation(present_target), retry_token), range(16)))
@@ -629,20 +630,20 @@ def main():
         for row in sql("SELECT event_type, payload FROM outbox_events;").splitlines():
             kind, raw_payload = row.split("\t", 1)
             payload = json.loads(raw_payload)
-            subject = "post_id" if kind.startswith("post.") else "target_user_id"
-            check(set(payload) == {"actor_id", subject}, "payload contains exactly the event's fields")
+            fields = {"post_id"} if kind.startswith("post.") else {"actor_id", "target_user_id", "relation_id"}
+            check(set(payload) == fields, "payload contains exactly the event's fields")
             check(all(type(value) is int and value > 0 for value in payload.values()), "payload contains positive integer IDs")
         events = [row.split() for row in sql(
-            "SELECT id, event_type, payload->>'$.actor_id', "
+            "SELECT id, event_type, COALESCE(payload->>'$.actor_id',0), "
             "COALESCE(payload->>'$.post_id',0), COALESCE(payload->>'$.target_user_id',0) "
             "FROM outbox_events ORDER BY id;").splitlines()]
         expected_post_events = []
         for row in sql("SELECT id, author_id, deleted_on IS NOT NULL FROM posts;").splitlines():
             post_id, author_id, deleted = map(int, row.split())
-            expected_post_events.append(("post.created", author_id, post_id))
+            expected_post_events.append(("post.created", post_id))
             if deleted:
-                expected_post_events.append(("post.deleted", author_id, post_id))
-        actual_post_events = [(kind, int(actor_id), int(post_id))
+                expected_post_events.append(("post.deleted", post_id))
+        actual_post_events = [(kind, int(post_id))
                               for _, kind, actor_id, post_id, _ in events if kind.startswith("post.")]
         check(sorted(actual_post_events) == sorted(expected_post_events), "every post effect has exactly one event")
         relation_balances = {}
@@ -655,9 +656,20 @@ def main():
         check(all(balance in (0, 1) for balance in relation_balances.values()), "relationship event balance")
         check({pair for pair, balance in relation_balances.items() if balance == 1} == current_pairs,
               "relationship event effects match authoritative relationships")
-        check(sql("SELECT id, event_type, payload->>'$.actor_id', payload->>'$.post_id' FROM outbox_events "
+        check(sql("SELECT id, event_type, payload->>'$.post_id' FROM outbox_events "
                   f"WHERE payload->>'$.post_id'={original_publication['id']} AND event_type='post.created';") == publication_event,
               "publication retries and deletion retain original event identity")
+        lifecycles = {}
+        for row in sql("SELECT event_type,payload->>'$.relation_id',payload->>'$.actor_id',payload->>'$.target_user_id' "
+                       "FROM outbox_events WHERE event_type LIKE 'follow.%';").splitlines():
+            kind, relation_id, actor_id, target_id = row.split()
+            identity = (int(relation_id), int(actor_id), int(target_id))
+            lifecycles.setdefault(identity, []).append(kind)
+        active = {tuple(map(int, row.split())) for row in sql("SELECT id,user_id,follow_id FROM following;").splitlines()}
+        for identity, kinds in lifecycles.items():
+            check(kinds.count("follow.created") == 1, "one creation per relationship identity")
+            check(kinds.count("follow.deleted") == (0 if identity in active else 1),
+                  "deleted event preserves the exact removed relationship identity")
         saved_events = sql("SELECT * FROM outbox_events ORDER BY id;")
         passed("outbox identities reconcile with posts and current relationships")
 

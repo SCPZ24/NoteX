@@ -11,6 +11,7 @@ import (
 
 	"github.com/SCPZ24/NoteX/src/internal/account"
 	"github.com/SCPZ24/NoteX/src/internal/config"
+	"github.com/SCPZ24/NoteX/src/internal/feed"
 	"github.com/SCPZ24/NoteX/src/internal/follow"
 	"github.com/SCPZ24/NoteX/src/internal/httpapi"
 	"github.com/SCPZ24/NoteX/src/internal/outbox"
@@ -40,6 +41,26 @@ func Run(ctx context.Context, cfg config.Config) error {
 			outbox.Run(workerCtx, db, wake, cfg.RabbitMQURL, cfg.QueuePrefix)
 		}()
 		// Stop the worker before closing the shared database pool.
+		defer func() {
+			cancelWorker()
+			<-workerDone
+		}()
+	}
+	if cfg.RedisURL != "" {
+		projection, err := feed.New(db, cfg.RedisURL, cfg.QueuePrefix)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		defer projection.Close()
+		workerCtx, cancelWorker := context.WithCancel(ctx)
+		workerDone := make(chan struct{})
+		go func() {
+			defer close(workerDone)
+			if err := outbox.RunExternalConsumer(workerCtx, db, cfg.RabbitMQURL, cfg.QueuePrefix, "feed", projection.Handle); err != nil {
+				slog.Error("feed consumer stopped", "error", err)
+			}
+		}()
 		defer func() {
 			cancelWorker()
 			<-workerDone

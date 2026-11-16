@@ -88,7 +88,7 @@ func TestConsumerIntegration(t *testing.T) {
 	body := func(id int64) []byte {
 		t.Helper()
 		result, err := json.Marshal(Event{ID: id, Type: PostCreated,
-			Payload: json.RawMessage(`{"actor_id":1,"post_id":99}`), CreatedOn: 1})
+			Payload: json.RawMessage(`{"post_id":99}`), CreatedOn: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -163,7 +163,7 @@ func TestConsumerIntegration(t *testing.T) {
 			t.Fatal("duplicate delivery bypassed backoff")
 		}
 		execute("UPDATE consumption_jobs SET next_attempt_on=0 WHERE id=?", id)
-		if err := retryConsumption(ctx, db, feed, DummyHandler(feed)); err != nil {
+		if err := retryConsumption(ctx, db, feed, func(ctx context.Context, id int64) error { return processJob(ctx, db, feed, id, DummyHandler(feed)) }); err != nil {
 			t.Fatal(err)
 		}
 		if count("SELECT COUNT(*) FROM dummy_effects WHERE event_id=2") != 1 {
@@ -325,7 +325,9 @@ func TestConsumerIntegration(t *testing.T) {
 		publish(search, 12)
 		failedBroker := &broker{url: url, prefix: prefix}
 		sessionCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := consumeSession(sessionCtx, db, failedBroker, "search", DummyHandler(search))
+		err := consumeSession(sessionCtx, db, failedBroker, "search", func(ctx context.Context, id int64) error {
+			return processJob(ctx, db, search, id, DummyHandler(search))
+		})
 		cancel()
 		failedBroker.close()
 		if err == nil || !strings.Contains(err.Error(), "receipt unavailable") {
@@ -416,7 +418,7 @@ func TestConsumerIntegration(t *testing.T) {
 		if err := Replay(ctx, db, "outbox", id, "still invalid"); err == nil {
 			t.Fatal("invalid outbox replay accepted")
 		}
-		execute(`UPDATE outbox_events SET payload='{"actor_id":1,"post_id":99}' WHERE id=?`, id)
+		execute(`UPDATE outbox_events SET payload='{"post_id":99}' WHERE id=?`, id)
 		if err := Replay(ctx, db, "outbox", id, "source payload repaired"); err != nil {
 			t.Fatal(err)
 		}
@@ -491,6 +493,90 @@ func TestConsumerIntegration(t *testing.T) {
 			return count("SELECT COUNT(*) FROM dummy_effects WHERE event_id=18") == 1 &&
 				count("SELECT COUNT(*) FROM dummy_effects WHERE event_id=19") == 2
 		})
+	})
+
+	t.Run("external claim releases SQL and fences expired workers", func(t *testing.T) {
+		id := receiveEvent(feed, 100)
+		entered, release := make(chan struct{}), make(chan struct{})
+		done := make(chan error, 1)
+		db.SetMaxOpenConns(1)
+		defer db.SetMaxOpenConns(10)
+		go func() {
+			done <- processExternal(ctx, db, feed, id, func(context.Context, Event) error {
+				close(entered)
+				<-release
+				return nil
+			})
+		}()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("claim failed to enter external handler")
+		}
+		// With a one-connection pool this update also proves the effect holds no SQL transaction.
+		queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, err := db.ExecContext(queryCtx, "UPDATE consumption_jobs SET next_attempt_on=0 WHERE id=?", id)
+		cancel()
+		if err != nil {
+			close(release)
+			<-done
+			t.Fatal(err)
+		}
+		err = processExternal(ctx, db, feed, id, func(context.Context, Event) error { return ErrPermanent })
+		close(release)
+		firstErr := <-done
+		if err != nil || firstErr != nil || count("SELECT COUNT(*) FROM consumption_jobs WHERE id=? AND status='failed' AND attempts=2", id) != 1 {
+			t.Fatalf("old worker overwrote new claim: %v %v", err, firstErr)
+		}
+	})
+
+	t.Run("external bounded retries waiting and replay", func(t *testing.T) {
+		id := receiveEvent(feed, 101)
+		for attempt := 1; attempt <= maxConsumerAttempts; attempt++ {
+			execute("UPDATE consumption_jobs SET next_attempt_on=0 WHERE id=?", id)
+			if err := processExternal(ctx, db, feed, id, func(context.Context, Event) error { return errors.New("remote timeout") }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if count("SELECT COUNT(*) FROM consumption_jobs WHERE id=? AND status='failed' AND attempts=5", id) != 1 {
+			t.Fatal("external retry bound missing")
+		}
+		if err := Replay(ctx, db, "consumer", id, "dependency restored"); err != nil {
+			t.Fatal(err)
+		}
+		if err := processExternal(ctx, db, feed, id, func(context.Context, Event) error { return ErrWaiting }); err != nil {
+			t.Fatal(err)
+		}
+		if count("SELECT COUNT(*) FROM consumption_jobs WHERE id=? AND status='waiting'", id) != 1 {
+			t.Fatal("waiting task lost")
+		}
+		if err := Replay(ctx, db, "consumer", id, "next stage available"); err != nil {
+			t.Fatal(err)
+		}
+		if err := processExternal(ctx, db, feed, id, func(context.Context, Event) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if count("SELECT COUNT(*) FROM consumption_jobs WHERE id=? AND status='completed' AND attempts=7", id) != 1 {
+			t.Fatal("external replay lost attempt identity")
+		}
+	})
+
+	t.Run("expired final external claim is auditable", func(t *testing.T) {
+		id := receiveEvent(feed, 102)
+		for range maxConsumerAttempts {
+			execute("UPDATE consumption_jobs SET next_attempt_on=0 WHERE id=?", id)
+			_, attempt, _, err := claimExternal(ctx, db, feed, id)
+			if err != nil || attempt == 0 {
+				t.Fatal("claim not retained", err)
+			}
+		}
+		execute("UPDATE consumption_jobs SET next_attempt_on=0 WHERE id=?", id)
+		if err := processExternal(ctx, db, feed, id, func(context.Context, Event) error { t.Fatal("exhausted task executed"); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if count("SELECT COUNT(*) FROM consumption_jobs WHERE id=? AND status='failed' AND attempts=5", id) != 1 {
+			t.Fatal("abandoned task not failed")
+		}
 	})
 
 }

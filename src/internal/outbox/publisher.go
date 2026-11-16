@@ -97,13 +97,13 @@ func (e Event) destinations(prefix string) ([]string, error) {
 	switch e.Type {
 	case PostCreated, PostDeleted:
 		var payload PostPayload
-		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.ActorID <= 0 || payload.PostID <= 0 {
+		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.PostID <= 0 {
 			return nil, errors.New("invalid post event payload")
 		}
 		return []string{prefix + ".feed", prefix + ".search"}, nil
 	case FollowCreated, FollowDeleted:
 		var payload FollowPayload
-		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.ActorID <= 0 || payload.TargetUserID <= 0 || payload.ActorID == payload.TargetUserID {
+		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.ActorID <= 0 || payload.TargetUserID <= 0 || payload.ActorID == payload.TargetUserID || payload.RelationID <= 0 {
 			return nil, errors.New("invalid follow event payload")
 		}
 		return []string{prefix + ".feed"}, nil

@@ -35,8 +35,8 @@ func Inspect(ctx context.Context, db *sql.DB, scope, status string, id, after in
 	if id < 0 || after < 0 || limit < 1 || limit > 100 {
 		return nil, errors.New("id/after must be nonnegative; limit must be 1-100")
 	}
-	if status != "" && status != "pending" && status != "failed" && status != "completed" {
-		return nil, errors.New("status must be pending, failed, or completed")
+	if status != "" && status != "pending" && status != "failed" && status != "completed" && status != "waiting" {
+		return nil, errors.New("status must be pending, waiting, failed, or completed")
 	}
 	var query string
 	switch scope {
@@ -129,8 +129,8 @@ func Replay(ctx context.Context, db *sql.DB, scope string, id int64, reason stri
 		if err != nil {
 			return err
 		}
-		if status != "failed" {
-			return errors.New("consumer replay requires a failed job")
+		if status != "failed" && status != "waiting" {
+			return errors.New("consumer replay requires a failed or waiting job")
 		}
 		if _, err := decodeDelivery(consumer, messageID, body); err != nil {
 			return fmt.Errorf("repair the source message before replay: %w", err)

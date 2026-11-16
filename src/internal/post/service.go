@@ -113,7 +113,7 @@ func (s *Service) Create(ctx context.Context, actor int64, requestKey, content s
 	if err != nil {
 		return Post{}, err
 	}
-	if err := outbox.RecordPost(ctx, tx, outbox.PostCreated, actor, item.ID, createdOn); err != nil {
+	if err := outbox.RecordPost(ctx, tx, outbox.PostCreated, item.ID, createdOn); err != nil {
 		return Post{}, err
 	}
 	// A lost COMMIT reply can leave the outcome unknown to Go. Return the error
@@ -194,7 +194,7 @@ func (s *Service) Delete(ctx context.Context, actor, id int64) error {
 		return err
 	}
 	if changed > 0 {
-		if err := outbox.RecordPost(ctx, tx, outbox.PostDeleted, actor, id, deletedOn); err != nil {
+		if err := outbox.RecordPost(ctx, tx, outbox.PostDeleted, id, deletedOn); err != nil {
 			return err
 		}
 	}

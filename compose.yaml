@@ -1,4 +1,17 @@
 services:
+  redis:
+    image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "127.0.0.1:6380:6379"
+    cpus: 1
+    mem_limit: 256m
+    volumes:
+      - redis_data:/data
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "2"
   rabbitmq:
     image: rabbitmq:4.2-management@sha256:7fa20d0d23d63ed90499bbf62e24af48ec4ae5eb22d173f3db96e3f85b26884a
     hostname: notex-rabbitmq
@@ -19,4 +32,5 @@ services:
         max-file: "2"
 
 volumes:
+  redis_data:
   rabbitmq_data:

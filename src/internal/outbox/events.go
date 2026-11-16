@@ -22,19 +22,19 @@ const (
 )
 
 type PostPayload struct {
-	ActorID int64 `json:"actor_id"`
-	PostID  int64 `json:"post_id"`
+	PostID int64 `json:"post_id"`
 }
 
 type FollowPayload struct {
 	ActorID      int64 `json:"actor_id"`
 	TargetUserID int64 `json:"target_user_id"`
+	RelationID   int64 `json:"relation_id"`
 }
 
 // RecordPost requires the caller's business transaction. The caller owns
 // Commit/Rollback, so a failed event insert also rolls back the business change.
-func RecordPost(ctx context.Context, tx *sql.Tx, eventType string, actor, postID, createdOn int64) error {
-	payload, err := json.Marshal(PostPayload{ActorID: actor, PostID: postID})
+func RecordPost(ctx context.Context, tx *sql.Tx, eventType string, postID, createdOn int64) error {
+	payload, err := json.Marshal(PostPayload{PostID: postID})
 	if err != nil {
 		return err
 	}
@@ -44,9 +44,9 @@ func RecordPost(ctx context.Context, tx *sql.Tx, eventType string, actor, postID
 	return err
 }
 
-// RecordFollow keeps both user IDs after the relationship row is deleted.
-func RecordFollow(ctx context.Context, tx *sql.Tx, eventType string, actor, target, createdOn int64) error {
-	payload, err := json.Marshal(FollowPayload{ActorID: actor, TargetUserID: target})
+// RecordFollow preserves the exact relationship identity in the business transaction.
+func RecordFollow(ctx context.Context, tx *sql.Tx, eventType string, actor, target, relationID, createdOn int64) error {
+	payload, err := json.Marshal(FollowPayload{ActorID: actor, TargetUserID: target, RelationID: relationID})
 	if err != nil {
 		return err
 	}

@@ -246,7 +246,7 @@ func TestPublisherIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	if err := outbox.RecordPost(context.Background(), tx, outbox.PostCreated, 1, first.ID, time.Now().Unix()); err != nil {
+	if err := outbox.RecordPost(context.Background(), tx, outbox.PostCreated, first.ID, time.Now().Unix()); err != nil {
 		t.Fatal(err)
 	}
 	create("later-id")

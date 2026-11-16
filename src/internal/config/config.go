@@ -15,6 +15,7 @@ type Config struct {
 	MySQLDSN    string
 	RabbitMQURL string
 	QueuePrefix string
+	RedisURL    string
 }
 
 // Load reads environment variables; it does not automatically load a .env file.
@@ -24,6 +25,7 @@ func Load() (Config, error) {
 		MySQLDSN:    os.Getenv("MYSQL_DSN"),
 		RabbitMQURL: os.Getenv("RABBITMQ_URL"),
 		QueuePrefix: os.Getenv("RABBITMQ_QUEUE_PREFIX"),
+		RedisURL:    os.Getenv("REDIS_URL"),
 	}
 	if cfg.HTTPAddr == "" {
 		cfg.HTTPAddr = "127.0.0.1:8080"
@@ -49,6 +51,9 @@ func Load() (Config, error) {
 		if _, err := amqp.ParseURI(cfg.RabbitMQURL); err != nil {
 			return Config{}, errors.New("RABBITMQ_URL is invalid")
 		}
+	}
+	if cfg.RedisURL != "" && cfg.RabbitMQURL == "" {
+		return Config{}, errors.New("REDIS_URL requires RABBITMQ_URL for the Feed consumer")
 	}
 	return cfg, nil
 }

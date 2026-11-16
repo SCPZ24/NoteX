@@ -32,15 +32,21 @@ func RunConsumer(ctx context.Context, db *sql.DB, url, prefix, name string, hand
 	if (name != "feed" && name != "search") || handler == nil {
 		return errors.New("consumer requires feed/search and a handler")
 	}
+	return runConsumer(ctx, db, url, prefix, name, func(ctx context.Context, id int64) error {
+		return processJob(ctx, db, prefix+"."+name, id, handler)
+	})
+}
+
+func runConsumer(ctx context.Context, db *sql.DB, url, prefix, name string, process func(context.Context, int64) error) error {
 	b := &broker{url: url, prefix: prefix}
 	defer b.close()
 	consumer := prefix + "." + name
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for ctx.Err() == nil {
-		err := retryConsumption(ctx, db, consumer, handler)
+		err := retryConsumption(ctx, db, consumer, process)
 		if err == nil {
-			err = consumeSession(ctx, db, b, name, handler)
+			err = consumeSession(ctx, db, b, name, process)
 		}
 		b.close()
 		if ctx.Err() != nil {
@@ -56,7 +62,7 @@ func RunConsumer(ctx context.Context, db *sql.DB, url, prefix, name string, hand
 	return nil
 }
 
-func consumeSession(ctx context.Context, db *sql.DB, b *broker, name string, handler SQLHandler) error {
+func consumeSession(ctx context.Context, db *sql.DB, b *broker, name string, process func(context.Context, int64) error) error {
 	if err := b.connect(ctx); err != nil {
 		return err
 	}
@@ -84,7 +90,7 @@ func consumeSession(ctx context.Context, db *sql.DB, b *broker, name string, han
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := retryConsumption(ctx, db, consumer, handler); err != nil {
+			if err := retryConsumption(ctx, db, consumer, process); err != nil {
 				return err
 			}
 		case delivery, ok := <-deliveries:
@@ -95,7 +101,7 @@ func consumeSession(ctx context.Context, db *sql.DB, b *broker, name string, han
 			if err != nil {
 				return err // Connection close requeues the unacknowledged delivery.
 			}
-			if err := processJob(ctx, db, consumer, id, handler); err != nil {
+			if err := process(ctx, id); err != nil {
 				return err
 			}
 			// Success, scheduled retry, or quarantine is now durable in MySQL.
@@ -181,7 +187,7 @@ func quarantine(ctx context.Context, db *sql.DB, consumer, messageID string, bod
 	return id, err
 }
 
-func retryConsumption(ctx context.Context, db *sql.DB, consumer string, handler SQLHandler) error {
+func retryConsumption(ctx context.Context, db *sql.DB, consumer string, process func(context.Context, int64) error) error {
 	queryCtx, cancel := context.WithTimeout(ctx, operationTimeout)
 	defer cancel()
 	rows, err := db.QueryContext(queryCtx, `SELECT id FROM consumption_jobs
@@ -205,7 +211,7 @@ func retryConsumption(ctx context.Context, db *sql.DB, consumer string, handler 
 		return err
 	}
 	for _, id := range ids {
-		if err := processJob(ctx, db, consumer, id, handler); err != nil {
+		if err := process(ctx, id); err != nil {
 			return err
 		}
 	}

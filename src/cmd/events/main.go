@@ -36,7 +36,7 @@ func run() error {
 	}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	scope := flags.String("scope", "consumer", "consumer or outbox")
-	status := flags.String("status", "", "filter pending, failed, or completed records")
+	status := flags.String("status", "", "filter pending, waiting, failed, or completed records")
 	id := flags.Int64("id", 0, "record ID (required for replay)")
 	after := flags.Int64("after", 0, "list records after this ID")
 	limit := flags.Int("limit", 20, "list at most 1-100 records")

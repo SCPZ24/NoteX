@@ -24,6 +24,16 @@ func (s *Service) distribute(ctx context.Context, event outbox.Event) error {
 	if current.Kind != "feed.chunk" || len(targets) == 0 || len(targets) > chunkSize {
 		return fmt.Errorf("%w: invalid distribution chunk", outbox.ErrPermanent)
 	}
+	if current.Body.ShardCount > 0 {
+		if current.Body.ShardCount != s.shards || current.Body.Shard < 0 || current.Body.Shard >= s.shards {
+			return fmt.Errorf("%w: shard topology mismatch", outbox.ErrPermanent)
+		}
+		for _, target := range targets {
+			if target.UserID <= 0 || int(target.UserID%int64(s.shards)) != current.Body.Shard {
+				return fmt.Errorf("%w: recipient outside shard", outbox.ErrPermanent)
+			}
+		}
+	}
 	if err := s.readerGenerations(ctx, targets); err != nil {
 		return err
 	}

@@ -1,4 +1,31 @@
 services:
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.6.5
+    profiles: ["governance"]
+    command:
+      - /usr/local/bin/etcd
+      - --name=notex-etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:23790
+      - --listen-peer-urls=http://127.0.0.1:2380
+      - --initial-advertise-peer-urls=http://127.0.0.1:2380
+      - --initial-cluster=notex-etcd=http://127.0.0.1:2380
+      - --quota-backend-bytes=134217728
+      - --auto-compaction-mode=periodic
+      - --auto-compaction-retention=1h
+      - --max-wals=2
+      - --max-snapshots=2
+    ports:
+      - "127.0.0.1:23790:2379"
+    cpus: 1
+    mem_limit: 256m
+    volumes:
+      - etcd_data:/etcd-data
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "2"
   redis:
     image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes", "--appendfsync", "everysec"]
@@ -32,5 +59,6 @@ services:
         max-file: "2"
 
 volumes:
+  etcd_data:
   redis_data:
   rabbitmq_data:

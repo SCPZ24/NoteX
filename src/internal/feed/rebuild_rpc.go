@@ -116,3 +116,8 @@ func (r *rebuildServer) EnsureIndex(ctx context.Context, req *corepb.EnsureIndex
 		return nil, status.Error(codes.Unavailable, "rebuild_unavailable")
 	}
 }
+
+// NewRebuildClient adapts an application-owned discovered gRPC connection.
+func NewRebuildClient(conn *grpc.ClientConn) *RebuildClient {
+	return &RebuildClient{rpc: corepb.NewFeedRebuildServiceClient(conn)}
+}

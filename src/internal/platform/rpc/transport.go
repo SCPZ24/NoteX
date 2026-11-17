@@ -6,10 +6,12 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"google.golang.org/grpc"
+	_ "google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/status"
 	"log/slog"
 	"net"
@@ -50,13 +52,23 @@ func Dial(ctx context.Context, address, secret string) (*grpc.ClientConn, error)
 	if err := ValidateAddress(address); err != nil {
 		return nil, err
 	}
+	return dial(ctx, "passthrough:///"+address, secret, nil)
+}
+
+// DialDiscovered uses a connection-scoped etcd directory and round-robin RPCs.
+func DialDiscovered(ctx context.Context, secret string, builder resolver.Builder) (*grpc.ClientConn, error) {
+	return dial(ctx, builder.Scheme()+":///service", secret, []grpc.DialOption{grpc.WithResolvers(builder), grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`)})
+}
+
+func dial(ctx context.Context, target, secret string, extra []grpc.DialOption) (*grpc.ClientConn, error) {
 	if len(secret) < 32 {
 		return nil, fmt.Errorf("RPC_TOKEN requires at least 32 characters")
 	}
-	conn, err := grpc.NewClient("passthrough:///"+address,
+	options := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDisableRetry(),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMessageBytes), grpc.MaxCallSendMsgSize(maxMessageBytes)),
-		grpc.WithUnaryInterceptor(clientInterceptor(secret)))
+		grpc.WithUnaryInterceptor(clientInterceptor(secret))}
+	conn, err := grpc.NewClient(target, append(options, extra...)...)
 	if err != nil {
 		return nil, err
 	}

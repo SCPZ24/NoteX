@@ -68,8 +68,9 @@ Core `/readyz` 检查 MySQL，Query 检查 Core 及部署策略，Rebuilder 检�
 worker 检查任务数据库与 Core，Relay 检查 MySQL。MQ 消费与投递由原有重连循环恢复，
 这些 readiness 检查不代表 MQ 已连接或事件已追平。
 
-这一批提供进程拆分及静态地址连接。固定分片、SAC、etcd 和多实例资源治理属于后续 Sprint 5 批次。
-拆分后的运行正确性及性能需要后续回归确认。
+设置 `ETCD_ENDPOINTS` 与 `INSTANCE_ID` 后可启用服务注册、Watch 目录和固定分片消费。
+治理模式的初始化、迁移、扩容命令和恢复流程见 [固定分片与 etcd](docs/operations/distributed.md)。
+当前新增实现完成编译与静态检查，运行正确性、故障接管和性能留待 diff 审查后的联调。
 
 ### 单进程运行
 

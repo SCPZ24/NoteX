@@ -14,6 +14,15 @@ func NewTaskPublisher(url, prefix string) *TaskPublisher {
 	return &TaskPublisher{broker: broker{url: url, prefix: prefix, extraQueues: []string{"feed.plan", "feed.chunk"}}}
 }
 
+// NewShardedPublisher declares the fixed topology before publishing.
+func NewShardedPublisher(url, prefix string, count int) *TaskPublisher {
+	p := NewTaskPublisher(url, prefix)
+	for shard := 0; shard < count; shard++ {
+		p.broker.extraQueues = append(p.broker.extraQueues, ShardName(shard))
+	}
+	return p
+}
+
 func (p *TaskPublisher) Close() { p.broker.close() }
 
 func (p *TaskPublisher) Publish(ctx context.Context, event Event) error {

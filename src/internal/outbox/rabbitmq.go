@@ -68,7 +68,11 @@ func (b *broker) connect(ctx context.Context) error {
 		b.channel = channel
 		for _, name := range append([]string{"feed", "search"}, b.extraQueues...) {
 			queue := b.prefix + "." + name
-			_, err = channel.QueueDeclare(queue, true, false, false, false, amqp.Table{"x-queue-type": "classic"})
+			args := amqp.Table{"x-queue-type": "classic"}
+			if isShard(name) {
+				args = amqp.Table{"x-queue-type": "quorum", "x-single-active-consumer": true, "x-delivery-limit": int32(-1)}
+			}
+			_, err = channel.QueueDeclare(queue, true, false, false, false, args)
 			if err != nil {
 				break
 			}

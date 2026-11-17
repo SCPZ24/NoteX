@@ -47,3 +47,8 @@ func Dial(ctx context.Context, address, secret string) (*Client, *grpc.ClientCon
 	}
 	return &Client{rpc: corepb.NewCoreReadServiceClient(conn)}, conn, nil
 }
+
+// NewClient adapts an application-owned discovered gRPC connection.
+func NewClient(conn *grpc.ClientConn) *Client {
+	return &Client{rpc: corepb.NewCoreReadServiceClient(conn)}
+}

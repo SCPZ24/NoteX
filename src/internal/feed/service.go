@@ -35,6 +35,7 @@ type Service struct {
 	stats       sync.Map
 	cache       *cache.Store
 	rebuilder   *RebuildClient
+	shards      int
 }
 
 // New creates a bounded client without requiring Redis to be online at startup.

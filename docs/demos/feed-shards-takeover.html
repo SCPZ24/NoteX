@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Feed 固定分片与接管 · NoteX</title>
+<style>
+:root { color-scheme: light; --ink:#183044; --muted:#65798b; --line:#d9e3e9; --paper:#f5f8fa; --red:#d35050; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.6 Inter,-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }
+main { max-width:1390px; margin:auto; padding:24px 32px 30px; }
+h1 { font-size:27px; letter-spacing:-.7px; margin:0; }
+p { margin:5px 0; }
+.intro { color:var(--muted); }
+.top { display:flex; justify-content:space-between; gap:20px; align-items:center; }
+.scope { color:#496579; font-size:12px; background:#e9eff4; padding:6px 11px; border-radius:7px; white-space:nowrap; }
+.stats { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin:20px 0 14px; }
+.stat { background:white; border:1px solid var(--line); border-radius:12px; padding:12px 16px; }
+.stat strong { font-size:28px; line-height:1.2; margin-right:9px; font-variant-numeric:tabular-nums; }
+.stat span { color:var(--muted); font-size:13px; }
+.stat small { display:block; font-size:12px; color:var(--muted); margin-top:3px; }
+.stat.primary { background:#e8f5ef; border-color:#c0dfce; }
+.toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+button,select { font:inherit; font-size:13px; border:1px solid #cbd7df; background:white; color:var(--ink); border-radius:7px; padding:7px 13px; cursor:pointer; }
+button:hover { background:#edf3f7; }
+button:focus-visible,select:focus-visible { outline:3px solid #5ca8e5; outline-offset:2px; }
+button:disabled { cursor:default; opacity:.45; }
+button.danger { border-color:#e4b4b4; color:#b03a3a; margin-left:10px; }
+.toolbar label,.toolbar .clock { color:var(--muted); font-size:12px; }
+.toolbar .clock { margin-left:auto; font-variant-numeric:tabular-nums; }
+.stage { margin-top:14px; background:white; border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+.phase { padding:12px 18px; background:#eff5f8; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; min-height:67px; }
+.phase strong { white-space:nowrap; }
+.phase p { font-size:13px; color:#506b7c; margin:0; }
+.viewport { overflow-x:auto; }
+svg { display:block; width:100%; min-width:1040px; height:auto; }
+svg text { font-family:inherit; fill:var(--ink); }
+svg .small { font-size:11px; fill:var(--muted); }
+svg .label { font-size:13px; font-weight:600; }
+.trace { padding:9px 18px; background:#fff9e9; color:#7c622d; border-top:1px solid #eee5cd; border-bottom:1px solid #eee5cd; font-size:13px; font-weight:600; }
+.legend { display:flex; gap:20px; flex-wrap:wrap; padding:0 18px 12px; font-size:12px; color:var(--muted); }
+.dot { width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px; }
+.bottom { display:grid;grid-template-columns:1.1fr 1fr;gap:20px;margin-top:14px; }
+.panel { background:white;border:1px solid var(--line);border-radius:12px;padding:14px 18px; }
+h2 { font-size:14px;margin:0 0 7px; }
+.panel p,.panel li { font-size:12px;color:#597182; }
+ul { margin:0;padding-left:17px; }
+.log { list-style:none;padding:0;min-height:100px; }
+.log li { padding:2px 0; }
+.log time { color:#8a9baa;display:inline-block;width:47px; }
+.note { font-size:12px; color:var(--muted); margin-top:12px; }
+@media(max-width:750px) { main {padding:17px 12px;} .top {display:block;} .scope {display:inline-block;margin-top:8px;} .stats {grid-template-columns:repeat(3,1fr);gap:7px;} .stat {padding:10px;} .stat strong {font-size:23px;} .bottom {grid-template-columns:1fr;} .phase {align-items:flex-start;} .toolbar .clock {width:100%;margin:0;} }
+</style>
+</head>
+<body>
+<main>
+<div class="top"><div><h1>从一篇帖子，到 4 个分片，再到扩容接管</h1><p class="intro">Planner 分页展开粉丝、生成 Chunk。4 条分片队列共有 <b>4 个活跃分发消费者</b>，可分布在 2 个或 3 个 Worker 进程里。</p></div><span class="scope">Feed 推模式 · 方案动画</span></div>
+<section class="stats" aria-label="实时状态">
+<div class="stat"><strong>4</strong><span>固定分片队列</span><small>队列 0、1、2、3</small></div>
+<div class="stat"><strong id="processCount">2</strong><span>在线分发进程</span><small>一个进程可以运行多个消费者</small></div>
+<div class="stat primary"><strong id="activeCount">4</strong><span>在线活跃分发消费者</span><small id="activeDetail">A 有 2 个，B 有 2 个</small></div>
+<div class="stat"><strong id="standbyCount">4</strong><span>在线备用分发消费者</span><small>已订阅，等待接管</small></div>
+<div class="stat"><strong id="lostCount">0</strong><span>失联的原活跃消费者</span><small>等待 RabbitMQ 检测并交接</small></div>
+</section>
+<div class="toolbar">
+<button id="play">暂停</button><button id="step">单步 +0.5 秒</button>
+<label for="speed">速度</label><select id="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select>
+<button id="expand">增加 Worker C</button><button class="danger" id="crash">模拟 Worker A 故障</button><button id="reset">重置演示</button>
+<span class="clock" id="clock">演示时间 0.0 秒</span>
+</div>
+<section class="stage">
+<div class="phase" aria-live="polite"><strong id="phaseTitle">① 正常分工</strong><p id="phaseText">跟随彩色消息从左向右看。读者编号决定队列，队列把消息交给该行标为「活跃」的消费者。</p></div>
+<div class="viewport"><svg id="planner" viewBox="0 0 1250 195" role="img" aria-label="Planner分页读取粉丝，按读者分片并生成Chunk"></svg></div><div class="trace" id="trace"></div><div class="viewport"><svg id="diagram" viewBox="0 0 1250 450" role="img" aria-label="四条分片队列向Worker进程内的活跃消费者投递消息，支持从两个进程扩容到三个进程及故障接管"></svg></div>
+<div class="legend"><span><i class="dot" style="background:#338aab"></i>胶囊 K 编号 = 一个 Chunk，含同分片多位读者</span><span>实线 → 活跃消费者</span><span>虚线 → 备用订阅</span><span>进度条满 → 完成并 ACK</span><span style="color:#c04e4e">红圈 ↶ → 未 ACK 任务重投递</span></div>
+</section>
+<section class="bottom">
+<div class="panel"><h2>看图时只记住这三件事</h2><ul><li>每一行是一条固定分片队列，右侧的 A / B / C 小框表示该进程对它的订阅。</li><li>大框代表进程，小框代表消费者。上方 Planner 放大展示 Worker 内部的规划角色，计数只统计下方分发消费者。</li><li>增加 C 后，先成为 Q2 备用，再通过订阅调整接手 Q2。总活跃数为 4。点击「暂停」和「单步」跟踪同一个 K 编号。</li></ul><p id="metrics">生成 0 · 路由中 0 · 排队 0 · 处理中 0 · 完成 0 · 重投递 0</p></div>
+<div class="panel"><h2>刚刚发生了什么</h2><ul class="log" id="log"></ul></div>
+</section>
+<p class="note">演示设定为 P = 4，初始 A 负责 Q0 / Q2，B 负责 Q1 / Q3。增加 C 的交接步骤为演示设定的订阅协调。SAC 按队列管理活跃消费者，负载分配需要应用层安排。本页使用 reader_id % 4 示意固定路由，每页 8 人；当前项目实际粉丝页上限为 500，Chunk 上限为 100。游标使用关系记录身份。</p><p class="note">本页演示扩容到 3 个分发进程。在 P = 4 且每分片串行的条件下，同阶段最多 4 条活跃执行流；更多进程可以分担工作或提供备用，性能取决于进程预算及依赖瓶颈。交接进行时请先观察交接完成，再模拟故障；故障后可重置体验扩容。检测和交接时长均为动画设定。正常交接简化了网络往返，实际仍需要在途准入与幂等保护。</p>
+<p class="note">本页展示 MQ 中未 ACK 消息的恢复。项目中已 ACK、落在 MySQL 的重试任务，还需要设计分片归属与执行调度。接管允许重复执行，最终数据正确性依赖幂等与条件写入。</p>
+</main>
+<script>
+'use strict';
+const svg = document.getElementById('diagram');
+const plannerSvg = document.getElementById('planner');
+const colors = ['#2d89b4', '#8a68b0', '#cd8630', '#288c79'];
+const pages = [[8,9,18,11,12,13,14,15], [16,17,22,19,20,21,26,23]];
+const rowY = [125,213,301,389];
+const consumerX = { A:660, B:880, C:1100 };
+const duration = 3.5;
+let state;
+let playing = true;
+let speed = 1;
+let previousTime = null;
+
+function log(message) {
+  state.log.unshift({ time:state.time.toFixed(1), message });
+  state.log = state.log.slice(0,5);
+}
+
+function reset() {
+  state = {
+    time:0, generated:0, completed:0, redelivered:0,
+    phase:'normal', crashAt:null, routes:[], log:[], flashes:[],
+    online:{ A:true, B:true, C:false },
+    expansion:{ phase:'idle', since:0 },
+    plan:{ post:101, page:0, phase:'request', age:0, chunks:[] },
+    shards:Array.from({length:4}, (_, id) => ({
+      id, owner:id % 2 === 0 ? 'A':'B', queue:[], flight:null,
+      subscribers:{ A:true, B:true, C:false }
+    }))
+  };
+  playing = true;
+  log('初始分工完成。Planner 开始展开帖子 P101，分发侧 4 活跃、4 备用。');
+  render();
+}
+
+function createChunks() {
+  state.plan.chunks = [];
+  for (let shard=0; shard<4; shard++) {
+    const job = {
+      id:++state.generated, readers:pages[state.plan.page].filter(reader=>reader % 4 === shard),
+      shard, post:state.plan.post, page:state.plan.page+1, age:0, retry:false
+    };
+    state.plan.chunks.push(job);
+    state.routes.push(job);
+  }
+  log(`P${state.plan.post} 第 ${state.plan.page+1} 页冻结 4 个 Chunk，按分片投递。`);
+}
+
+function advancePlanner(delta) {
+  const plan = state.plan;
+  plan.age += delta;
+  if (plan.age < 2.4) return;
+  if (plan.phase === 'request') plan.phase = 'group';
+  else if (plan.phase === 'group') {
+    if (state.generated-state.completed >= 32) return;
+    plan.phase = 'publish';
+    createChunks();
+  } else if (plan.phase === 'publish') plan.phase = 'next';
+  else {
+    if (plan.page === 0) {
+      plan.page = 1;
+      log(`P${plan.post} 保存下一页规划任务，携带关系游标 rel-008 继续读取。`);
+    } else {
+      plan.page = 0;
+      plan.post++;
+      log(`上一帖粉丝已展开，新帖子 P${plan.post} 进入规划队列。`);
+    }
+    plan.phase = 'request';
+    plan.chunks = [];
+  }
+  plan.age = 0;
+}
+
+function expand() {
+  if (state.phase !== 'normal' || state.expansion.phase !== 'idle') return;
+  state.online.C = true;
+  state.shards[2].subscribers.C = true;
+  state.expansion = { phase:'subscribed', since:state.time };
+  log('C 上线，只订阅 Q2，成为备用。Q2 仍由 A · C2 消费。');
+  render();
+}
+
+function advanceExpansion() {
+  const expansion = state.expansion;
+  const shard = state.shards[2];
+  if (expansion.phase === 'subscribed' && state.time-expansion.since >= 2.5) {
+    shard.subscribers.B = false;
+    expansion.phase = 'draining';
+    expansion.since = state.time;
+    log('协调交接 Q2。B · C2 暂时退订，A · C2 停止领取并等待在途 ACK。');
+  }
+  if (expansion.phase === 'draining' && state.time-expansion.since >= 2.5 && !shard.flight) {
+    shard.subscribers.A = false;
+    shard.owner = 'C';
+    expansion.phase = 'transferred';
+    expansion.since = state.time;
+    log('A · C2 已完成在途 ACK 并退订。C 是唯一接替候选，SAC 将 Q2 交给 C。');
+  }
+  if (expansion.phase === 'transferred' && state.time-expansion.since >= 2.5) {
+    shard.subscribers.A = true;
+    shard.subscribers.B = true;
+    expansion.phase = 'done';
+    expansion.since = state.time;
+    log('A / B 重新成为 Q2 备用。最终 A 负责 Q0，B 负责 Q1 / Q3，C 负责 Q2。');
+  }
+}
+
+function crash() {
+  if (state.phase !== 'normal' || isHandoff()) return;
+  state.phase = 'detecting';
+  state.crashAt = state.time;
+  state.online.A = false;
+  log('Worker A 已退出，等待 RabbitMQ 检测。A 的在途 Chunk 尚未 ACK。');
+  render();
+}
+
+function takeover() {
+  state.phase = 'taken';
+  for (const shard of state.shards) {
+    if (shard.owner !== 'A') continue;
+    if (shard.flight) {
+      const job = shard.flight;
+      job.age = 0;
+      job.retry = true;
+      shard.queue.unshift(job);
+      shard.flight = null;
+      state.redelivered++;
+      state.flashes.push({ shard:shard.id, id:job.id, age:0 });
+      log(`Q${shard.id} 的 K${job.id} 未 ACK，已重新入队。`);
+    }
+    shard.owner = 'B';
+  }
+  log('检测结束。B 接管 A 原先负责的队列，在线活跃分发消费者恢复为 4。');
+}
+
+function isHandoff() {
+  return ['subscribed','draining','transferred'].includes(state.expansion.phase);
+}
+
+function advance(delta) {
+  state.time += delta;
+  advancePlanner(delta);
+  advanceExpansion();
+  for (const job of state.routes) job.age += delta;
+  const arrived = state.routes.filter(job=>job.age>=1.8);
+  state.routes = state.routes.filter(job=>job.age<1.8);
+  for (const job of arrived) {
+    job.age = 0;
+    state.shards[job.shard].queue.push(job);
+  }
+  if (state.phase==='detecting' && state.time-state.crashAt>=3) takeover();
+  for (const shard of state.shards) {
+    if (!state.online[shard.owner]) continue;
+    if (shard.flight) {
+      shard.flight.age += delta;
+      if (shard.flight.age>=duration) {
+        const job = shard.flight;
+        state.completed++;
+        log(`${shard.owner} · C${shard.id} 完成 K${job.id}（读者 ${job.readers.join(' / ')}）并 ACK${job.retry?'，本次为重投递':''}。`);
+        shard.flight = null;
+      }
+    }
+    const draining = shard.id===2 && state.expansion.phase==='draining';
+    if (!draining && !shard.flight && shard.queue.length) {
+      shard.flight = shard.queue.shift();
+      shard.flight.age = 0;
+    }
+  }
+  for (const flash of state.flashes) flash.age += delta;
+  state.flashes = state.flashes.filter(flash=>flash.age<1.5);
+}
+
+function text(x,y,value,klass='small',extra='') {
+  return `<text x="${x}" y="${y}" class="${klass}" ${extra}>${value}</text>`;
+}
+
+function capsule(x,y,job) {
+  return `<rect x="${x-20}" y="${y-12}" width="40" height="24" rx="12" fill="${colors[job.shard]}" stroke="${job.retry?'#d94b4b':'white'}" stroke-width="${job.retry?3:2}"/>` +
+    `<text x="${x}" y="${y+4}" text-anchor="middle" style="fill:white;font-size:11px;font-weight:700">K${job.id}</text>`;
+}
+
+function renderPlanner() {
+  const plan = state.plan;
+  const grouping = plan.phase!=='request';
+  const groups = Array.from({length:4},(_,id)=>pages[plan.page].filter(reader=>reader%4===id));
+  let result = text(22,25,'上游放大 · 一个规划执行流程','label');
+  result += text(22,44,'Worker 内 Planner 角色 · Root 已折叠');
+  result += '<rect x="22" y="69" width="127" height="72" rx="10" fill="#edf2f6" stroke="#cbd9e2"/>';
+  result += text(85,94,`帖子 P${plan.post}`,'label','text-anchor="middle"');
+  result += text(85,115,plan.page?'Planner → 续页任务':'Root → 首次规划','small','text-anchor="middle"');
+  result += '<path d="M149 105 H265" stroke="#8fa7b5" stroke-width="2"/>';
+  result += '<rect x="165" y="94" width="82" height="22" rx="11" fill="#eff5f9" stroke="#8fa7b5"/>';
+  result += text(206,85,'MQ · feed.plan','small','text-anchor="middle"');
+  result += text(206,109,`P${plan.post} / 页${plan.page+1}`,'small','text-anchor="middle"');
+  if (plan.phase==='request' && plan.age<0.6) {
+    result += `<circle cx="${149+116*plan.age/0.6}" cy="105" r="5" fill="#5485b3"/>`;
+  }
+  result += '<rect x="267" y="61" width="218" height="90" rx="10" fill="#eaf0fa" stroke="#b9cde1"/>';
+  result += text(283,83,'Planner · 分页规划','label');
+  result += text(283,104,`第 ${plan.page+1} / 2 页 · after=${plan.page?'rel-008':'起点'}`);
+  result += text(283,126,plan.phase==='next'?(plan.page?'本帖结束 → 下一篇帖子':'生成续页任务 → feed.plan'):'每页粉丝按 reader_id % 4 归组');
+  result += '<path d="M485 94 H525 M525 121 H485" stroke="#8fa7b5" stroke-width="2"/>';
+  result += '<rect x="527" y="61" width="210" height="90" rx="10" fill="#edf7f1" stroke="#bfd9c9"/>';
+  result += text(543,83,'Core RPC · ListFollowers','label');
+  result += text(543,105,grouping?'返回粉丝页（8 人）':'读取 MySQL 粉丝页…');
+  result += text(543,127,grouping?pages[plan.page].join(' · '):'关系游标分页 · 每页有界');
+  if (plan.phase==='request' && plan.age>=0.6) {
+    const progress=(plan.age-0.6)/1.8;
+    const x=progress<.5?485+40*progress*2:525-40*(progress-.5)*2;
+    result += `<circle cx="${x}" cy="${progress<.5?94:121}" r="5" fill="#5485b3"/>`;
+  }
+  result += text(765,27,'按分片归组 → 冻结 Chunk → 投递下方同编号队列','label');
+  for(let shard=0;shard<4;shard++) {
+    const x=765+(shard%2)*229;
+    const y=45+Math.floor(shard/2)*66;
+    result += `<rect x="${x}" y="${y}" width="212" height="57" rx="8" fill="${colors[shard]}" fill-opacity=".07" stroke="${colors[shard]}"/>`;
+    result += text(x+12,y+21,`Q${shard} · ${grouping?'读者 '+groups[shard].join(' / '):'等待粉丝页'}`,'label');
+    const job=plan.chunks[shard];
+    result += text(x+12,y+43,job?`K${job.id} · P${job.post} / 页${job.page} → Q${shard}`:grouping?'2 位读者 → 1 个 Chunk':'读取完成后归组');
+  }
+  const phases={ request:'读取粉丝页', group:'按接收者归组', publish:'Chunk 已持久化并投递', next:plan.page?'准备下一帖':'保存游标并继续下一页' };
+  result += text(267,176,`当前步骤 · ${phases[plan.phase]}`,'label');
+  plannerSvg.innerHTML=result;
+}
+
+function consumer(shard,worker) {
+  const x=consumerX[worker], y=rowY[shard.id];
+  const offline=!state.online[worker];
+  const subscribed=shard.subscribers[worker];
+  const active=shard.owner===worker;
+  const draining=worker==='A' && shard.id===2 && state.expansion.phase==='draining';
+  const fill=offline?'#f5f5f5':active?'#edf7f3':'#f7f9fa';
+  const border=offline?'#dedede':active?colors[shard.id]:'#d7e1e7';
+  let label=offline?(worker==='C'?'未启动':active?'失联待检测':'离线'):!subscribed?'未订阅':active?(draining?'收尾中':'活跃'):'备用';
+  if(worker==='B' && shard.id===2 && !subscribed && state.online.C) label='暂时退订';
+  let result=`<rect x="${x-80}" y="${y-31}" width="160" height="62" rx="8" fill="${fill}" stroke="${border}" stroke-width="${active?2:1}"/>`;
+  result+=text(x-67,y-10,`${worker} · C${shard.id}`,'label');
+  result+=text(x+67,y-10,label,'small','text-anchor="end"');
+  if(active && shard.flight) {
+    const job=shard.flight;
+    const progress=Math.max(0,(job.age-.75)/(duration-.75));
+    result+=text(x-67,y+9,`K${job.id} · 读者 ${job.readers.join(' / ')}`);
+    result+=`<rect x="${x-67}" y="${y+19}" width="134" height="4" rx="2" fill="#dce6e8"/><rect x="${x-67}" y="${y+19}" width="${134*progress}" height="4" rx="2" fill="${offline?'#cf6666':colors[shard.id]}"/>`;
+  } else result+=text(x-67,y+14,offline?'进程未在线':!subscribed?'无该队列订阅':active?(draining?'等待交接期限':'等待 Chunk'):'已订阅 · 等待接管');
+  return result;
+}
+
+function linkPoints(shard,worker) {
+  const y=rowY[shard.id];
+  if(worker==='A') return [[500,y],[580,y]];
+  const lane=y+(worker==='B'?40:49);
+  const x=consumerX[worker]-91;
+  return [[500,y],[520,lane],[x,lane],[x,y],[consumerX[worker]-80,y]];
+}
+
+function positionOnPath(points,progress) {
+  const lengths=points.slice(1).map((point,i)=>Math.hypot(point[0]-points[i][0],point[1]-points[i][1]));
+  let distance=lengths.reduce((a,b)=>a+b,0)*progress;
+  let index=0;
+  while(index<lengths.length-1 && distance>lengths[index]) {distance-=lengths[index];index++;}
+  const fraction=distance/lengths[index];
+  return points[index].map((coordinate,axis)=>coordinate+(points[index+1][axis]-coordinate)*fraction);
+}
+
+function renderDiagram() {
+  let result='<defs><marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7" fill="#859eac"/></marker></defs>';
+  result+=text(22,25,'下游 · Chunk 分发阶段','label');
+  result+=text(245,25,'RabbitMQ · 固定 4 个分片','label');
+  result+=text(22,45,'K 编号与上方 Planner 一致');
+  for(const worker of ['A','B','C']) {
+    const x=consumerX[worker];
+    result+=`<rect x="${x-101}" y="47" width="202" height="391" rx="13" fill="${state.online[worker]?'#f5f8fa':'#f7f7f7'}" stroke="#d6e1e7"/>`;
+    result+=text(x,70,`Worker ${worker} · 分发部分`,'label','text-anchor="middle"');
+    const active=state.shards.filter(s=>s.owner===worker&&state.online[worker]).length;
+    const standby=state.shards.filter(s=>s.owner!==worker&&s.subscribers[worker]&&state.online[worker]).length;
+    result+=text(x,88,state.online[worker]?`${active} 活跃 · ${standby} 备用`:(worker==='C'?'点击按钮增加此进程':'已退出'),'small','text-anchor="middle"');
+  }
+  result+='<rect x="22" y="203" width="153" height="76" rx="10" fill="#eaf0fa" stroke="#bccfe3"/>';
+  result+=text(98,228,'Planner 已冻结的 Chunk','label','text-anchor="middle"');
+  result+=text(98,250,'按 shard_id 投递','small','text-anchor="middle"');
+  result+=text(98,267,'每个 Chunk 含 2 位读者','small','text-anchor="middle"');
+  for(const shard of state.shards) {
+    const y=rowY[shard.id], color=colors[shard.id];
+    result+=`<path d="M175 242 H207 V${y} H248" fill="none" stroke="${color}" opacity=".45"/>`;
+    result+=`<rect x="250" y="${y-20}" width="240" height="40" fill="${color}" fill-opacity=".06" stroke="${color}"/><ellipse cx="250" cy="${y}" rx="9" ry="20" fill="white" stroke="${color}"/><ellipse cx="490" cy="${y}" rx="9" ry="20" fill="${color}" fill-opacity=".09" stroke="${color}"/>`;
+    result+=text(250,y-30,`分片 ${shard.id} · 队列 Q${shard.id}`,'label');
+    result+=text(489,y-30,`${shard.queue.length} 等待`,'small','text-anchor="end"');
+    for(const worker of ['A','B','C']) {
+      if(!shard.subscribers[worker]) continue;
+      const points=linkPoints(shard,worker);
+      const active=shard.owner===worker;
+      const online=state.online[worker];
+      const path=points.map((p,i)=>`${i?'L':'M'}${p[0]} ${p[1]}`).join(' ');
+      result+=`<path d="${path}" fill="none" stroke="${online?(active?color:'#b8c7d1'):'#d3a3a3'}" stroke-width="${active?2.3:1}" ${active?'':'stroke-dasharray="4 5"'} opacity="${active?1:.6}" marker-end="url(#arrow)"/>`;
+    }
+    shard.queue.slice(0,5).forEach((job,index)=>{result+=capsule(466-index*44,y,job);});
+    for(const worker of ['A','B','C']) result+=consumer(shard,worker);
+    if(shard.flight && shard.flight.age<.75) {
+      const [x,yy]=positionOnPath(linkPoints(shard,shard.owner),shard.flight.age/.75);
+      result+=capsule(x,yy,shard.flight);
+    }
+  }
+  for(const job of state.routes) {
+    const points=[[154,242],[207,242],[207,rowY[job.shard]],[250,rowY[job.shard]]];
+    const [x,y]=positionOnPath(points,job.age/1.8);
+    result+=capsule(x,y,job);
+  }
+  for(const flash of state.flashes) result+=text(25,rowY[flash.shard]-8,`↶ K${flash.id} 重新入队`,'label','style="fill:#c64c4c"');
+  svg.innerHTML=result;
+}
+
+function render() {
+  const active=state.shards.filter(shard=>state.online[shard.owner]).length;
+  const lost=state.shards.filter(shard=>!state.online[shard.owner]).length;
+  let standby=0;
+  for(const shard of state.shards) for(const worker of ['A','B','C']) {
+    if(state.online[worker] && shard.subscribers[worker] && shard.owner!==worker) standby++;
+  }
+  document.getElementById('processCount').textContent=Object.values(state.online).filter(Boolean).length;
+  document.getElementById('activeCount').textContent=active;
+  document.getElementById('standbyCount').textContent=standby;
+  document.getElementById('lostCount').textContent=lost;
+  document.getElementById('activeDetail').textContent=['A','B','C'].filter(w=>state.online[w]).map(w=>`${w} 有 ${state.shards.filter(s=>s.owner===w).length} 个`).join('，');
+  let title='① 正常分工';
+  let detail='上方先看粉丝页如何形成 Chunk，再跟随同一个 K 编号进入下方队列和消费者。';
+  const expansion=state.expansion.phase;
+  if(expansion==='subscribed') {title='扩容 ① C 已上线';detail='C 只订阅 Q2，成为备用。A 继续消费 Q2，当前活跃数量仍为 4。';}
+  if(expansion==='draining') {title='扩容 ② 协调交接';detail='B 暂退 Q2 备用订阅。A 停止领取 Q2 新任务，完成在途任务并 ACK 后退订。C 是唯一接替候选。';}
+  if(expansion==='transferred') {title='扩容 ③ C 接手 Q2';detail='A 已退订 Q2，SAC 激活 C。Q2 开始由 C 消费，接下来恢复 A / B 的备用订阅。';}
+  if(expansion==='done') {title='扩容完成 · 3 个进程';detail='A 负责 Q0，B 负责 Q1 / Q3，C 负责 Q2。A / B 恢复 Q2 备用订阅。总共 4 个活跃分发消费者。';}
+  if(state.phase==='detecting') {title='故障 · 等待检测';detail=`A 已退出，其原队列暂时积压。演示检测剩余 ${Math.max(0,3-(state.time-state.crashAt)).toFixed(1)} 秒；其他进程继续消费。`;}
+  if(state.phase==='taken') {title='故障 · 接管完成';detail='A 的未 ACK Chunk 已重新入队，B 接管 A 原先的队列。4 条队列继续推进，活跃分发消费者恢复为 4。';}
+  document.getElementById('phaseTitle').textContent=title;
+  document.getElementById('phaseText').textContent=detail;
+  document.getElementById('play').textContent=playing?'暂停':'继续';
+  document.getElementById('crash').disabled=state.phase!=='normal'||isHandoff();
+  document.getElementById('crash').title=isHandoff()?'交接完成后可模拟故障':'';
+  document.getElementById('expand').disabled=state.phase!=='normal'||expansion!=='idle';
+  document.getElementById('expand').title=state.phase!=='normal'?'重置后可体验扩容':'';
+  document.getElementById('clock').textContent=`演示时间 ${state.time.toFixed(1)} 秒${playing?'':' · 已暂停'}`;
+  const owner=state.shards[2].owner;
+  document.getElementById('trace').textContent=`固定路由追踪 · 读者 18 % 4 = 2 → Q2 → Worker ${owner} · C2${state.online[owner]?'':'（失联待检测）'}。读者 18 出现在每篇帖子的第 1 页。`;
+  const queued=state.shards.reduce((sum,shard)=>sum+shard.queue.length,0);
+  const flight=state.shards.filter(shard=>shard.flight).length;
+  document.getElementById('metrics').textContent=`Chunk 生成 ${state.generated} · 路由中 ${state.routes.length} · 排队 ${queued} · 未 ACK ${flight} · 完成 ${state.completed} · 重投递 ${state.redelivered}`;
+  document.getElementById('log').innerHTML=state.log.map(item=>`<li><time>${item.time}s</time>${item.message}</li>`).join('');
+  renderPlanner();
+  renderDiagram();
+}
+
+document.getElementById('play').onclick=()=>{playing=!playing;render();};
+document.getElementById('step').onclick=()=>{playing=false;for(let i=0;i<10;i++)advance(.05);render();};
+document.getElementById('speed').onchange=event=>{speed=Number(event.target.value);};
+document.getElementById('crash').onclick=crash;
+document.getElementById('expand').onclick=expand;
+document.getElementById('reset').onclick=reset;
+function frame(timestamp) {
+  if(previousTime!==null && playing) {
+    advance(Math.min((timestamp-previousTime)/1000,.1)*speed);
+    render();
+  }
+  previousTime=timestamp;
+  requestAnimationFrame(frame);
+}
+reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -24,6 +24,12 @@ import (
 // Run starts exactly the configured process role. The empty role preserves
 // programmatic callers of the combined-process baseline.
 func Run(ctx context.Context, cfg config.Config) error {
+	if len(cfg.EtcdEndpoints) > 0 {
+		if err := openControl(ctx, &cfg); err != nil {
+			return err
+		}
+		defer cfg.Control.Close()
+	}
 	switch cfg.Role {
 	case "", "all":
 		return runCombined(ctx, cfg)

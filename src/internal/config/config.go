@@ -8,11 +8,16 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/SCPZ24/NoteX/src/internal/control"
 	transport "github.com/SCPZ24/NoteX/src/internal/platform/rpc"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type Config struct {
+	EtcdEndpoints    []string
+	InstanceID       string
+	Version          string
+	Control          *control.Node
 	Role             string
 	CoreRPCAddr      string
 	RebuilderRPCAddr string
@@ -30,6 +35,9 @@ type Config struct {
 // Load reads environment variables; it does not automatically load a .env file.
 func Load() (Config, error) {
 	cfg := Config{
+		EtcdEndpoints:    control.Endpoints(os.Getenv("ETCD_ENDPOINTS")),
+		InstanceID:       os.Getenv("INSTANCE_ID"),
+		Version:          os.Getenv("SERVICE_VERSION"),
 		Role:             os.Getenv("NOTEX_ROLE"),
 		CoreRPCAddr:      os.Getenv("CORE_RPC_ADDR"),
 		RebuilderRPCAddr: os.Getenv("REBUILDER_RPC_ADDR"),
@@ -132,6 +140,17 @@ func Load() (Config, error) {
 	}
 	if (cfg.Role == "feed-worker" || cfg.Role == "relay") && cfg.RabbitMQURL == "" {
 		return Config{}, errors.New("this role requires RABBITMQ_URL")
+	}
+	if len(cfg.EtcdEndpoints) > 0 {
+		if cfg.Role == "all" {
+			return Config{}, errors.New("etcd governance requires a split process role")
+		}
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`).MatchString(cfg.InstanceID) {
+			return Config{}, errors.New("INSTANCE_ID is required for etcd governance")
+		}
+		if cfg.Version == "" {
+			cfg.Version = "dev"
+		}
 	}
 	return cfg, nil
 }

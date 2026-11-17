@@ -8,6 +8,11 @@
 `http://127.0.0.1:8081`。路径、JSON 结构、Bearer 会话及游标格式沿用本文约定。
 进程角色、内部 RPC 和依赖配置见 [分进程启动说明](../README.md#分进程运行)。
 
+启用 etcd 治理模式后，各角色增加 `GET /controlz`，返回 `instance_id`、`config_revision`、
+`applied_revision`、`registered` 和 `last_control_error`。该运维接口沿用本机监听方式，
+通过 revision 观察配置应用进度。`registered` 表示进程最近观察到的注册状态，
+业务依赖健康由 `/readyz` 表达。启动与扩容步骤见 [治理运行说明](operations/distributed.md)。
+
 该文档应随开发进程渐进式更新。
 
 ## 通用约定
@@ -16,7 +21,7 @@
 - 注册、登录使用 JSON 请求体，并设置 `Content-Type: application/json`。
 - 业务请求体上限为 4096 字节。超过限制或 JSON 解析失败时，当前实现返回 `400 invalid_input`。
 - 业务请求设置 5 秒 Context 超时，数据库操作继承此超时。
-- 除注册、登录及健康检查外，所有接口要求 `Authorization: Bearer <token>`。
+- 除注册、登录、健康检查及 `/controlz` 外，所有接口要求 `Authorization: Bearer <token>`。
 - ID 是正整数。时间字段均为 Unix 秒。
 - 成功响应直接返回对象，错误响应统一为 `{"error":"错误代码"}`。
 - 登录响应及通过认证的业务响应设置 `Cache-Control: no-store`。

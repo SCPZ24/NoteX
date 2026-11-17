@@ -28,6 +28,8 @@ type recipient struct {
 
 type taskBody struct {
 	PostID     int64       `json:"post_id"`
+	ShardCount int         `json:"shard_count,omitempty"`
+	Shard      int         `json:"shard,omitempty"`
 	After      *Entry      `json:"after,omitempty"` // Entry.ID is following.id for this cursor.
 	Recipients []recipient `json:"recipients,omitempty"`
 }
@@ -191,9 +193,8 @@ func (s *Service) preparePage(ctx context.Context, event outbox.Event) ([]int64,
 		children = append(children, id)
 		return nil
 	}
-	for offset := 0; offset < len(recipients); offset += chunkSize {
-		end := min(offset+chunkSize, len(recipients))
-		if err := insert("feed.chunk", taskBody{PostID: current.Body.PostID, Recipients: recipients[offset:end]}); err != nil {
+	for _, body := range partitionRecipients(current.Body.PostID, recipients, s.shards) {
+		if err := insert("feed.chunk", body); err != nil {
 			return nil, err
 		}
 	}
@@ -217,15 +218,21 @@ func (s *Service) preparePage(ctx context.Context, event outbox.Event) ([]int64,
 
 // Only a page's bounded children are read; there is no whole-fanout materialization.
 func (s *Service) publishTasks(ctx context.Context, ids []int64, publish func(context.Context, outbox.Event) error) error {
-	if len(ids) > 7 {
+	if len(ids) > planPageSize+2 {
 		return fmt.Errorf("%w: oversized page handoff", outbox.ErrPermanent)
 	}
 	for _, id := range ids {
 		var event outbox.Event
+		var body []byte
 		event.ID = id
-		if err := s.db.QueryRowContext(ctx, "SELECT kind,created_on FROM feed_tasks WHERE id=?", id).Scan(&event.Type, &event.CreatedOn); err != nil {
+		if err := s.db.QueryRowContext(ctx, "SELECT kind,created_on,body FROM feed_tasks WHERE id=?", id).Scan(&event.Type, &event.CreatedOn, &body); err != nil {
 			return err
 		}
+		var task taskBody
+		if err := json.Unmarshal(body, &task); err != nil {
+			return err
+		}
+		event.ShardCount, event.Shard = task.ShardCount, task.Shard
 		event.Payload = json.RawMessage(fmt.Sprintf(`{"task_id":%d}`, id))
 		if err := publish(ctx, event); err != nil {
 			return err
@@ -265,5 +272,28 @@ func loadTask(ctx context.Context, query taskQuerier, event outbox.Event, lock b
 	if err := json.Unmarshal(body, &current.Body); err != nil || current.Body.PostID <= 0 {
 		return task{}, fmt.Errorf("%w: invalid task body", outbox.ErrPermanent)
 	}
+	if current.Body.ShardCount != event.ShardCount || current.Body.Shard != event.Shard {
+		return task{}, fmt.Errorf("%w: shard envelope conflict", outbox.ErrPermanent)
+	}
 	return current, nil
+}
+
+// partitionRecipients freezes routing by reader identity. Legacy unsharded
+// tasks retain their original representation when replayed.
+func partitionRecipients(postID int64, recipients []recipient, count int) []taskBody {
+	groups := make([][]recipient, max(1, count))
+	for _, target := range recipients {
+		shard := 0
+		if count > 0 {
+			shard = int(target.UserID % int64(count))
+		}
+		groups[shard] = append(groups[shard], target)
+	}
+	var chunks []taskBody
+	for shard, group := range groups {
+		for offset := 0; offset < len(group); offset += chunkSize {
+			chunks = append(chunks, taskBody{PostID: postID, ShardCount: count, Shard: shard, Recipients: group[offset:min(offset+chunkSize, len(group))]})
+		}
+	}
+	return chunks
 }

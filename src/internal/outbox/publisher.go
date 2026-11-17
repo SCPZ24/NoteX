@@ -17,11 +17,13 @@ const (
 
 // Event is the stable envelope shared by the publisher and consumers.
 type Event struct {
-	ID        int64           `json:"event_id"`
-	Type      string          `json:"event_type"`
-	Payload   json.RawMessage `json:"payload"`
-	CreatedOn int64           `json:"created_on"`
-	Attempts  uint64          `json:"-"`
+	ID         int64           `json:"event_id"`
+	Type       string          `json:"event_type"`
+	Payload    json.RawMessage `json:"payload"`
+	CreatedOn  int64           `json:"created_on"`
+	ShardCount int             `json:"shard_count,omitempty"`
+	Shard      int             `json:"shard,omitempty"`
+	Attempts   uint64          `json:"-"`
 }
 
 // Run scans at startup, on coalesced wakeups, and on a recovery timer. All SQL
@@ -101,6 +103,15 @@ func (e Event) destinations(prefix string) ([]string, error) {
 		}
 		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.TaskID <= 0 || payload.TaskID != e.ID {
 			return nil, errors.New("invalid Feed task identity")
+		}
+		if e.ShardCount != 0 {
+			if e.Type != "feed.chunk" || e.ShardCount < 1 || e.ShardCount > 32 || e.Shard < 0 || e.Shard >= e.ShardCount {
+				return nil, errors.New("invalid shard envelope")
+			}
+			return []string{prefix + "." + ShardName(e.Shard)}, nil
+		}
+		if e.Shard != 0 {
+			return nil, errors.New("shard without topology")
 		}
 		return []string{prefix + "." + e.Type}, nil
 	case PostCreated, PostDeleted:

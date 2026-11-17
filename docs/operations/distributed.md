@@ -1,6 +1,6 @@
 # 固定分片、接管与 etcd
 
-本批提供 Stage 2、Stage 3 的代码入口。验证范围为编译、Go 静态检查和 diff 检查。真实 MQ 接管、etcd 故障恢复与多实例运行留待 diff 审查后的联调。
+Stage 2、Stage 3 已完成本机真实 MQ 接管、etcd 故障恢复与多实例联调。关键故障各执行五轮，资源对照采用每组三轮结果。完整配置、数据、测量口径与原始证据入口见 [多实例回归报告](distributed-regression.md)。
 
 ## 启用治理模式
 
@@ -161,8 +161,8 @@ flowchart LR
 | `RunShardRetries`、`republishDue` | 到期记录 → 投递领取 → confirm → MQ receipt 接续恢复 |
 | `workerSlot` | 获取独占连接锁 → 核对持久拓扑 → 监测连接 → 收尾释放 |
 
-## 后续运行验收
+## 运行验收
 
-diff 审查后，需要约定总资源预算，再验证两个和三个 Worker 的实际活跃归属、SIGKILL 接管、旧写入晚到、重试投递确认窗口、降并发、同槽位重复启动、etcd 断开重连与 revision 压缩。故障注入轮数与性能对照沿用 Sprint 5 验收矩阵。
+本轮按用户确认的 4 GiB 内存、2 GiB 新增磁盘和最多三个 Worker 执行。两个和三个 Worker 的活跃归属、SIGKILL 接管、迟到写入、重试投递确认窗口、降并发、同槽位重复启动、etcd 断开重连与 revision 压缩均完成核对。测试复用现有 Redis、RabbitMQ、MySQL 和同一个测试库，etcd 容器创建一次，故障通过进程信号、TCP 隔离和容器暂停／恢复注入。
 
 本机单节点 etcd 和单节点 RabbitMQ quorum 队列用于进程与连接故障实验。集群多数派故障实验需要另行安排多节点部署及资源。

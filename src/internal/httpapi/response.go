@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/SCPZ24/NoteX/src/internal/account"
+	"github.com/SCPZ24/NoteX/src/internal/cache"
 	"github.com/SCPZ24/NoteX/src/internal/follow"
 	"github.com/SCPZ24/NoteX/src/internal/post"
 	"github.com/gin-gonic/gin"
@@ -31,6 +32,10 @@ func writeError(c *gin.Context, err error) {
 		status, code = http.StatusNotFound, "post_not_found"
 	case errors.Is(err, post.ErrForbidden):
 		status, code = http.StatusForbidden, "forbidden"
+	case errors.Is(err, post.ErrCacheUnavailable):
+		status, code = http.StatusServiceUnavailable, "cache_invalidation_pending"
+	case errors.Is(err, cache.ErrBusy):
+		status, code = http.StatusServiceUnavailable, "cache_busy"
 	case errors.Is(err, follow.ErrBusy):
 		status, code = http.StatusServiceUnavailable, "relationship_busy"
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):

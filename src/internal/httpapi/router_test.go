@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/SCPZ24/NoteX/src/internal/cache"
+	"github.com/SCPZ24/NoteX/src/internal/post"
 	"github.com/gin-gonic/gin"
 )
 
@@ -39,5 +41,20 @@ func TestHealthChecksDuringDatabaseFailure(t *testing.T) {
 	}
 	if checks != 1 {
 		t.Errorf("got %d database checks; only readiness should access the database", checks)
+	}
+}
+
+func TestCacheFailureResponses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		err  error
+		code string
+	}{{post.ErrCacheUnavailable, "cache_invalidation_pending"}, {cache.ErrBusy, "cache_busy"}} {
+		response := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(response)
+		writeError(ctx, tc.err)
+		if response.Code != http.StatusServiceUnavailable || response.Body.String() != `{"error":"`+tc.code+`"}` {
+			t.Fatalf("response=%d %s", response.Code, response.Body.String())
+		}
 	}
 }

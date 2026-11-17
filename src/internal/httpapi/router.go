@@ -43,6 +43,7 @@ type handlers struct {
 // FeedReader is implemented by both the SQL baseline and the Redis-backed Feed.
 type FeedReader interface {
 	Feed(context.Context, int64, string, int) (post.Page, error)
+	List(context.Context, int64, string, int) (post.Page, error)
 }
 
 // RegisterAPI leaves the existing health routes available without authentication.

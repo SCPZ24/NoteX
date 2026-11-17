@@ -28,7 +28,7 @@ func DecodeCursor(value string, owner int64, kind string) (Cursor, error) {
 	if err := json.Unmarshal(data, &result); err != nil {
 		return result, ErrInvalidCursor
 	}
-	if (result.Source != "" && (kind != "feed" || result.Source != "sql")) || result.Owner != owner || result.Kind != kind || result.CreatedOn <= 0 || result.ID <= 0 {
+	if (result.Source != "" && ((kind != "feed" && kind != "user_posts") || result.Source != "sql")) || result.Owner != owner || result.Kind != kind || result.CreatedOn <= 0 || result.ID <= 0 {
 		return result, ErrInvalidCursor
 	}
 	return result, nil

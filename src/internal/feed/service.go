@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SCPZ24/NoteX/src/internal/cache"
 	"github.com/SCPZ24/NoteX/src/internal/outbox"
 	"github.com/SCPZ24/NoteX/src/internal/post"
 	"github.com/redis/go-redis/v9"
@@ -33,6 +34,7 @@ type Service struct {
 	policy      string
 	sql         *post.Service
 	stats       sync.Map
+	cache       *cache.Store
 }
 
 // New creates a bounded client without requiring Redis to be online at startup.
@@ -67,11 +69,18 @@ func New(db *sql.DB, redisURL, prefix, mode string, pullAuthors []int64) (*Servi
 	options.PoolSize = 4
 	options.MaxRetries = -1
 	options.ContextTimeoutEnabled = true
-	return &Service{db: db, redis: redis.NewClient(options), prefix: prefix, mode: mode, pullAuthors: authors, policy: policy, sql: post.New(db, nil)}, nil
+	r := redis.NewClient(options)
+	store := cache.New(r, prefix)
+	sqlPosts := post.New(db, nil)
+	sqlPosts.UseCache(store)
+	return &Service{db: db, redis: r, prefix: prefix, mode: mode, pullAuthors: authors, policy: policy, sql: sqlPosts, cache: store}, nil
 }
 
 // Close releases the Redis client after the consumer has stopped.
-func (s *Service) Close() error { return s.redis.Close() }
+func (s *Service) Close() error { s.cache.Close(); return s.redis.Close() }
+
+// Cache returns the instance-wide cache coordinator for detail requests.
+func (s *Service) Cache() *cache.Store { return s.cache }
 
 // Handle reconciles a post's current authoritative state with its author index.
 // Relationship events reconcile the active reader index against current SQL.
@@ -107,6 +116,11 @@ func (s *Service) Handle(ctx context.Context, event outbox.Event) error {
 	}
 	if err != nil {
 		return err
+	}
+	if deleted.Valid {
+		if err := s.sql.InvalidateBody(ctx, entry.ID); err != nil {
+			return err
+		}
 	}
 	return s.apply(ctx, author, entry, deleted.Valid, sources[0].state.generation)
 }

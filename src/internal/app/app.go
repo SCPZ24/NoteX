@@ -55,6 +55,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 		}
 		defer projection.Close()
 		reader = projection
+		posts.UseCache(projection.Cache())
 		workerCtx, cancelWorker := context.WithCancel(ctx)
 		workerDone := make(chan struct{})
 		go func() {

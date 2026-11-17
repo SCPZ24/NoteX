@@ -158,7 +158,7 @@ return 1
 
 // SQL snapshot installation is guarded by both generation and revision. At most
 // 500 members are installed. Any event applied during the snapshot forces retry.
-var installCache = redis.NewScript(`
+const installCacheLua = `
 if redis.call('HGET',KEYS[4],'generation')~=ARGV[1] or redis.call('HGET',KEYS[4],'revision')~=ARGV[2] then return 0 end
 local ttl=redis.call('PTTL',KEYS[4])
 if ttl<=0 then return 0 end
@@ -186,7 +186,13 @@ redis.call('HSET',KEYS[4],'floor',ARGV[3],'count',n,'ready','1')
 if #ARGV==5+n*3 then redis.call('HSET',KEYS[4],'signature',ARGV[5+n*3]) end
 for _,key in ipairs(KEYS) do redis.call('PEXPIRE',key,ttl) end
 return 1
-`)
+`
+
+var installCache = redis.NewScript(installCacheLua)
+var installAuthorCache = redis.NewScript(`
+if redis.call('GET',KEYS[5])~=ARGV[#ARGV] then return 0 end
+table.remove(ARGV)
+` + installCacheLua)
 
 // Every Redis pipeline, including script-cache fallback, has at most 32 commands.
 func (s *Service) scriptBatch(ctx context.Context, script *redis.Script, calls []scriptCall) ([]*redis.Cmd, error) {

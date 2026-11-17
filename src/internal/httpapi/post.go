@@ -75,7 +75,7 @@ func (h *handlers) listPosts(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	page, err := h.posts.List(c.Request.Context(), owner, c.Query("cursor"), limit)
+	page, err := h.feed.List(c.Request.Context(), owner, c.Query("cursor"), limit)
 	if err != nil {
 		writeError(c, err)
 		return

@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/SCPZ24/NoteX/src/internal/cache"
 	"github.com/SCPZ24/NoteX/src/internal/outbox"
 	"github.com/go-sql-driver/mysql"
 )
@@ -43,8 +44,9 @@ type Page struct {
 }
 
 type Service struct {
-	db   *sql.DB
-	wake chan<- struct{}
+	db    *sql.DB
+	wake  chan<- struct{}
+	cache *cache.Store
 }
 
 func New(db *sql.DB, wake chan<- struct{}) *Service { return &Service{db: db, wake: wake} }
@@ -148,6 +150,16 @@ func (s *Service) Get(ctx context.Context, id int64) (Post, error) {
 	if id <= 0 {
 		return Post{}, ErrInvalid
 	}
+	if s.cache != nil {
+		return s.cachedGet(ctx, id)
+	}
+	return s.getSQL(ctx, id)
+}
+
+func (s *Service) getSQL(ctx context.Context, id int64) (Post, error) {
+	if id <= 0 {
+		return Post{}, ErrInvalid
+	}
 	var item Post
 	err := s.db.QueryRowContext(ctx, `SELECT p.id, u.id, u.username, p.content, p.created_on
 		FROM posts p JOIN users u ON u.id = p.author_id
@@ -204,7 +216,7 @@ func (s *Service) Delete(ctx context.Context, actor, id int64) error {
 	if changed > 0 {
 		outbox.Notify(s.wake)
 	}
-	return nil
+	return s.InvalidateBody(ctx, id)
 }
 
 func (s *Service) List(ctx context.Context, owner int64, after string, limit int) (Page, error) {

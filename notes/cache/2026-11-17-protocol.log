@@ -1,0 +1,62 @@
+=== RUN   TestBodyCacheProtocol
+=== RUN   TestBodyCacheProtocol/1
+=== RUN   TestBodyCacheProtocol/2
+=== RUN   TestBodyCacheProtocol/3
+=== RUN   TestBodyCacheProtocol/4
+=== RUN   TestBodyCacheProtocol/5
+=== RUN   TestBodyCacheProtocol/6
+=== RUN   TestBodyCacheProtocol/7
+=== RUN   TestBodyCacheProtocol/8
+=== RUN   TestBodyCacheProtocol/9
+=== RUN   TestBodyCacheProtocol/10
+=== RUN   TestBodyCacheProtocol/11
+=== RUN   TestBodyCacheProtocol/12
+=== RUN   TestBodyCacheProtocol/13
+=== RUN   TestBodyCacheProtocol/14
+=== RUN   TestBodyCacheProtocol/15
+=== RUN   TestBodyCacheProtocol/16
+=== RUN   TestBodyCacheProtocol/17
+=== RUN   TestBodyCacheProtocol/18
+=== RUN   TestBodyCacheProtocol/19
+=== RUN   TestBodyCacheProtocol/20
+--- PASS: TestBodyCacheProtocol (0.13s)
+    --- PASS: TestBodyCacheProtocol/1 (0.02s)
+    --- PASS: TestBodyCacheProtocol/2 (0.01s)
+    --- PASS: TestBodyCacheProtocol/3 (0.01s)
+    --- PASS: TestBodyCacheProtocol/4 (0.01s)
+    --- PASS: TestBodyCacheProtocol/5 (0.01s)
+    --- PASS: TestBodyCacheProtocol/6 (0.01s)
+    --- PASS: TestBodyCacheProtocol/7 (0.01s)
+    --- PASS: TestBodyCacheProtocol/8 (0.01s)
+    --- PASS: TestBodyCacheProtocol/9 (0.01s)
+    --- PASS: TestBodyCacheProtocol/10 (0.00s)
+    --- PASS: TestBodyCacheProtocol/11 (0.00s)
+    --- PASS: TestBodyCacheProtocol/12 (0.00s)
+    --- PASS: TestBodyCacheProtocol/13 (0.00s)
+    --- PASS: TestBodyCacheProtocol/14 (0.00s)
+    --- PASS: TestBodyCacheProtocol/15 (0.00s)
+    --- PASS: TestBodyCacheProtocol/16 (0.00s)
+    --- PASS: TestBodyCacheProtocol/17 (0.00s)
+    --- PASS: TestBodyCacheProtocol/18 (0.00s)
+    --- PASS: TestBodyCacheProtocol/19 (0.00s)
+    --- PASS: TestBodyCacheProtocol/20 (0.00s)
+PASS
+ok  	github.com/SCPZ24/NoteX/src/internal/post	2.185s
+=== RUN   TestCacheRecoveryIntegration
+=== RUN   TestCacheRecoveryIntegration/author_list_lazy_build_and_historical_pagination
+=== RUN   TestCacheRecoveryIntegration/two_real_processes_one_author_rebuild
+    cache_integration_test.go:215: process 0: map[build_started:1 lease_contended:1]
+    cache_integration_test.go:215: process 1: map[author_built:1 build_started:1 sql_operations:1]
+=== RUN   TestCacheRecoveryIntegration/author_stale_lease_and_revision_reject
+=== RUN   TestCacheRecoveryIntegration/body_hit_no_SQL_and_synchronous_deletion
+=== RUN   TestCacheRecoveryIntegration/Redis_unavailable_bounded_fallback_and_deletion_retry
+=== NAME  TestCacheRecoveryIntegration
+    cache_integration_test.go:374: cache counters: map[author_built:2 author_list_hit:15 author_sql_fallback:4 body_built:1 body_deleted:3 body_hit:1 body_miss:1 build_started:3 sql_operations:39]
+--- PASS: TestCacheRecoveryIntegration (1.80s)
+    --- PASS: TestCacheRecoveryIntegration/author_list_lazy_build_and_historical_pagination (0.12s)
+    --- PASS: TestCacheRecoveryIntegration/two_real_processes_one_author_rebuild (1.14s)
+    --- PASS: TestCacheRecoveryIntegration/author_stale_lease_and_revision_reject (0.02s)
+    --- PASS: TestCacheRecoveryIntegration/body_hit_no_SQL_and_synchronous_deletion (0.02s)
+    --- PASS: TestCacheRecoveryIntegration/Redis_unavailable_bounded_fallback_and_deletion_retry (0.01s)
+PASS
+ok  	github.com/SCPZ24/NoteX/src/internal/feed	4.296s

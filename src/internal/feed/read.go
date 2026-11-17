@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/SCPZ24/NoteX/src/internal/cache"
 	"github.com/SCPZ24/NoteX/src/internal/post"
 	"github.com/redis/go-redis/v9"
 )
@@ -55,7 +56,9 @@ func (s *Service) Feed(ctx context.Context, actor int64, after string, limit int
 		s.renewReader(cacheCtx, actor)
 		return s.sqlPage(ctx, actor, after, limit, "history", true)
 	}
-	sources, reason, err := s.sources(ctx, actor)
+	var sources []cacheSource
+	var reason string
+	err := s.cache.SQL(ctx, func(query context.Context) error { var e error; sources, reason, e = s.sources(query, actor); return e })
 	if err != nil {
 		return post.Page{}, err
 	}
@@ -69,20 +72,34 @@ func (s *Service) Feed(ctx context.Context, actor int64, after string, limit int
 	if sources[0].state.signature != sources[0].signature && sources[0].state.signature != "pending" {
 		return s.sqlPage(ctx, actor, after, limit, "relationship_change", false)
 	}
+	// Rebuilt author candidates can serve this request, rather than warming only
+	// after every overlapping caller has already executed a full SQL Feed query.
+	rebuilt := 0
+	for _, source := range sources {
+		if source.author && !source.state.ready && rebuilt < 4 {
+			_ = s.ensureAuthor(cacheCtx, source)
+			rebuilt++
+		}
+	}
+	if rebuilt > 0 {
+		if err := s.touchSources(cacheCtx, sources); err != nil {
+			return s.sqlPage(ctx, actor, after, limit, "redis", false)
+		}
+	}
 	cold := false
 	for _, source := range sources {
 		cold = cold || !source.state.ready
 	}
 	if cold {
-		// Serve this page from SQL first. Warm at most four bounded source snapshots
-		// per request; a concurrent update makes installation fail conservatively.
+		// Missing reader coverage still uses the baseline SQL path. Author builds
+		// were already attempted above; do not restart their retry budget here.
 		page, err := s.sqlPage(ctx, actor, after, limit, "cold", false)
 		if err != nil {
 			return page, err
 		}
 		warmed := 0
 		for _, source := range sources {
-			if !source.state.ready && warmed < 4 {
+			if !source.author && !source.state.ready && warmed < 4 {
 				if err := s.warmSource(cacheCtx, source); err != nil {
 					s.recordPath("warm_failed")
 				} else {
@@ -137,7 +154,12 @@ func (s *Service) renewReader(ctx context.Context, actor int64) {
 }
 func (s *Service) sqlPage(ctx context.Context, actor int64, after string, limit int, reason string, historical bool) (post.Page, error) {
 	s.recordPath("sql_" + reason)
-	page, err := s.sql.Feed(ctx, actor, after, limit)
+	var page post.Page
+	err := s.cache.SQL(ctx, func(query context.Context) error {
+		var e error
+		page, e = s.sql.Feed(query, actor, after, limit)
+		return e
+	})
 	if err != nil || !page.HasMore || !historical {
 		return page, err
 	}
@@ -205,6 +227,13 @@ func (s *Service) sources(ctx context.Context, actor int64) ([]cacheSource, stri
 }
 
 func (s *Service) warmSource(ctx context.Context, source cacheSource) error {
+	if source.author {
+		return s.ensureAuthor(ctx, source)
+	}
+	return s.warmSnapshot(ctx, source, "")
+}
+
+func (s *Service) warmSnapshot(ctx context.Context, source cacheSource, token string) error {
 	query := `SELECT p.id,p.created_on,0 FROM posts p WHERE p.deleted_on IS NULL AND p.author_id=?`
 	args := []any{source.owner}
 	if !source.author {
@@ -227,25 +256,26 @@ func (s *Service) warmSource(ctx context.Context, source cacheSource) error {
 		}
 	}
 	query += " ORDER BY p.created_on DESC,p.id DESC LIMIT 501"
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return err
-	}
 	type snapshotEntry struct {
 		entry    Entry
 		relation int64
 	}
 	items := make([]snapshotEntry, 0, retainedPosts+1)
-	for rows.Next() {
-		var item snapshotEntry
-		if err := rows.Scan(&item.entry.ID, &item.entry.CreatedOn, &item.relation); err != nil {
-			rows.Close()
+	err := s.cache.SQL(ctx, func(queryCtx context.Context) error {
+		rows, err := s.db.QueryContext(queryCtx, query, args...)
+		if err != nil {
 			return err
 		}
-		items = append(items, item)
-	}
-	err = rows.Err()
-	rows.Close()
+		defer rows.Close()
+		for rows.Next() {
+			var item snapshotEntry
+			if err := rows.Scan(&item.entry.ID, &item.entry.CreatedOn, &item.relation); err != nil {
+				return err
+			}
+			items = append(items, item)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return err
 	}
@@ -266,12 +296,19 @@ func (s *Service) warmSource(ctx context.Context, source cacheSource) error {
 		values = append(values, member(item.entry), strconv.FormatInt(item.entry.ID, 10), relation)
 	}
 	values = append(values, source.signature)
-	applied, err := installCache.Run(ctx, s.redis, s.cacheKeys(source), values...).Int()
+	script := installCache
+	keys := s.cacheKeys(source)
+	if token != "" {
+		script = installAuthorCache
+		keys = append(keys, keys[3]+":build")
+		values = append(values, token)
+	}
+	applied, err := script.Run(ctx, s.redis, keys, values...).Int()
 	if err != nil {
 		return err
 	}
 	if applied != 1 {
-		return errors.New("cache snapshot superseded")
+		return cache.ErrSuperseded
 	}
 	return nil
 }
@@ -360,7 +397,12 @@ func (s *Service) cachedPage(ctx context.Context, actor int64, before *Entry, li
 			for _, entry := range entries[start:end] {
 				ids = append(ids, entry.ID)
 			}
-			items, err := s.sql.FeedCandidates(ctx, actor, ids, limit+1-len(page.Items))
+			var items []post.Post
+			err := s.cache.SQL(ctx, func(query context.Context) error {
+				var e error
+				items, e = s.sql.FeedCandidates(query, actor, ids, limit+1-len(page.Items))
+				return e
+			})
 			if err != nil {
 				return post.Page{}, "", err
 			}

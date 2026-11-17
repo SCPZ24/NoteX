@@ -1,0 +1,27 @@
+=== RUN   TestCacheRecoveryIntegration
+=== RUN   TestCacheRecoveryIntegration/author_list_lazy_build_and_historical_pagination
+=== RUN   TestCacheRecoveryIntegration/two_real_processes_one_author_rebuild
+    cache_integration_test.go:215: process 0: map[build_started:1 lease_contended:1]
+    cache_integration_test.go:215: process 1: map[author_built:1 build_started:1 sql_operations:1]
+=== RUN   TestCacheRecoveryIntegration/author_stale_lease_and_revision_reject
+=== RUN   TestCacheRecoveryIntegration/body_hit_no_SQL_and_synchronous_deletion
+=== RUN   TestCacheRecoveryIntegration/Redis_unavailable_bounded_fallback_and_deletion_retry
+=== RUN   TestCacheRecoveryIntegration/isolated_Redis_60_second_outage_and_restart
+    cache_integration_test.go:345: outage elapsed=9.014s reads=20 committed_writes=10 unconfirmed_deletes=10
+    cache_integration_test.go:345: outage elapsed=19.024s reads=40 committed_writes=20 unconfirmed_deletes=20
+    cache_integration_test.go:345: outage elapsed=29.028s reads=60 committed_writes=30 unconfirmed_deletes=30
+    cache_integration_test.go:345: outage elapsed=39.036s reads=80 committed_writes=40 unconfirmed_deletes=40
+    cache_integration_test.go:345: outage elapsed=49.044s reads=100 committed_writes=50 unconfirmed_deletes=50
+    cache_integration_test.go:345: outage elapsed=59.053s reads=120 committed_writes=60 unconfirmed_deletes=60
+    cache_integration_test.go:371: outage duration >=60s; reads=120 writes=60 unconfirmed_deletes=60 recovery=12.372625ms
+=== NAME  TestCacheRecoveryIntegration
+    cache_integration_test.go:374: cache counters: map[author_built:2 author_list_hit:16 author_sql_fallback:4 body_built:3 body_deleted:3 body_hit:1 body_miss:3 body_sql_fallback:60 build_started:5 sql_operations:224]
+--- PASS: TestCacheRecoveryIntegration (61.82s)
+    --- PASS: TestCacheRecoveryIntegration/author_list_lazy_build_and_historical_pagination (0.07s)
+    --- PASS: TestCacheRecoveryIntegration/two_real_processes_one_author_rebuild (0.11s)
+    --- PASS: TestCacheRecoveryIntegration/author_stale_lease_and_revision_reject (0.03s)
+    --- PASS: TestCacheRecoveryIntegration/body_hit_no_SQL_and_synchronous_deletion (0.01s)
+    --- PASS: TestCacheRecoveryIntegration/Redis_unavailable_bounded_fallback_and_deletion_retry (0.00s)
+    --- PASS: TestCacheRecoveryIntegration/isolated_Redis_60_second_outage_and_restart (61.39s)
+PASS
+ok  	github.com/SCPZ24/NoteX/src/internal/feed	65.007s

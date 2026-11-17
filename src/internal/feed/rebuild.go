@@ -10,6 +10,9 @@ import (
 )
 
 func (s *Service) ensureAuthor(ctx context.Context, source cacheSource) error {
+	if s.rebuilder != nil {
+		return s.rebuilder.ensure(ctx, source, s.policy, s.prefix)
+	}
 	key := s.cacheKeys(source)[3] + ":build"
 	return s.cache.Do(ctx, key+":"+source.signature, func(task context.Context) error {
 		sources := []cacheSource{source}
@@ -90,15 +93,8 @@ func (s *Service) List(ctx context.Context, owner int64, after string, limit int
 		}
 	}
 	// Author existence is distinct from an existing author with no posts.
-	var exists bool
-	err := s.cache.SQL(ctx, func(query context.Context) error {
-		return s.db.QueryRowContext(query, "SELECT EXISTS(SELECT 1 FROM users WHERE id=?)", owner).Scan(&exists)
-	})
-	if err != nil {
+	if _, err := s.authority.GetUser(ctx, owner); err != nil {
 		return post.Page{}, err
-	}
-	if !exists {
-		return post.Page{}, post.ErrUserNotFound
 	}
 	cacheCtx, cancel := context.WithTimeout(ctx, cache.BuildTimeout)
 	defer cancel()
@@ -135,12 +131,7 @@ func (s *Service) List(ctx context.Context, owner int64, after string, limit int
 }
 
 func (s *Service) authorSQL(ctx context.Context, owner int64, after string, limit int) (post.Page, error) {
-	var page post.Page
-	err := s.cache.SQL(ctx, func(query context.Context) error {
-		var e error
-		page, e = s.sql.List(query, owner, after, limit)
-		return e
-	})
+	page, err := s.authority.ReadAuthorPage(ctx, owner, after, limit)
 	if err == nil && page.HasMore {
 		cursor, e := post.DecodeCursor(page.NextCursor, owner, "user_posts")
 		if e != nil {

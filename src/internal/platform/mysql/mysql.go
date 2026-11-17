@@ -13,6 +13,14 @@ import (
 // Open creates one shared connection pool for the application.
 // The caller owns the pool and must close it after requests have stopped.
 func Open(ctx context.Context, dsn string) (*sql.DB, error) {
+	return OpenWithLimit(ctx, dsn, 10)
+}
+
+// OpenWithLimit assigns a connection budget to one independently deployed role.
+func OpenWithLimit(ctx context.Context, dsn string, maximum int) (*sql.DB, error) {
+	if maximum < 1 {
+		return nil, errors.New("MySQL connection budget must be positive")
+	}
 	cfg, err := driver.ParseDSN(dsn)
 	if err != nil {
 		// Do not include the DSN or parser error: they can contain credentials.
@@ -32,8 +40,8 @@ func Open(ctx context.Context, dsn string) (*sql.DB, error) {
 		return nil, errors.New("cannot configure MySQL connector")
 	}
 	db := sql.OpenDB(connector)
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
+	db.SetMaxOpenConns(maximum)
+	db.SetMaxIdleConns(min(5, maximum))
 	db.SetConnMaxLifetime(3 * time.Minute)
 	db.SetConnMaxIdleTime(time.Minute)
 

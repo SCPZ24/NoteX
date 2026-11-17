@@ -296,21 +296,39 @@ func (s *Service) list(ctx context.Context, owner int64, kind, after string, lim
 // FeedCandidates loads a bounded set of Redis candidates against current SQL
 // relationships and deletion state. It returns only authoritative visible posts.
 func (s *Service) FeedCandidates(ctx context.Context, actor int64, ids []int64, limit int) ([]Post, error) {
+	return s.candidates(ctx, actor, "feed", ids, limit)
+}
+
+// AuthorCandidates validates author ownership as well as deletion state.
+func (s *Service) AuthorCandidates(ctx context.Context, author int64, ids []int64, limit int) ([]Post, error) {
+	return s.candidates(ctx, author, "user_posts", ids, limit)
+}
+
+func (s *Service) candidates(ctx context.Context, actor int64, kind string, ids []int64, limit int) ([]Post, error) {
 	if actor <= 0 || len(ids) == 0 || len(ids) > 256 || limit < 1 || limit > 101 {
 		return nil, ErrInvalid
 	}
-	placeholders := make([]string, len(ids))
-	args := []any{actor, actor}
-	for i, id := range ids {
+	predicate := "p.author_id=?"
+	args := []any{actor}
+	if kind == "feed" {
+		predicate = "(p.author_id=? OR EXISTS(SELECT 1 FROM following f WHERE f.user_id=? AND f.follow_id=p.author_id))"
+		args = append(args, actor)
+	}
+	placeholders := make([]string, 0, len(ids))
+	seen := make(map[int64]bool, len(ids))
+	for _, id := range ids {
 		if id <= 0 {
 			return nil, ErrInvalid
 		}
-		placeholders[i] = "?"
-		args = append(args, id)
+		if !seen[id] {
+			seen[id] = true
+			placeholders = append(placeholders, "?")
+			args = append(args, id)
+		}
 	}
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `SELECT p.id,u.id,u.username,p.content,p.created_on FROM posts p JOIN users u ON u.id=p.author_id
- WHERE p.deleted_on IS NULL AND (p.author_id=? OR EXISTS(SELECT 1 FROM following f WHERE f.user_id=? AND f.follow_id=p.author_id))
+ WHERE p.deleted_on IS NULL AND `+predicate+`
  AND p.id IN (`+strings.Join(placeholders, ",")+`) ORDER BY p.created_on DESC,p.id DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, err

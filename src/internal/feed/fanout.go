@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SCPZ24/NoteX/src/internal/core/corepb"
 	"github.com/SCPZ24/NoteX/src/internal/outbox"
+	"github.com/SCPZ24/NoteX/src/internal/post"
 )
 
 const (
@@ -83,11 +85,11 @@ func (s *Service) handleRoot(ctx context.Context, event outbox.Event, publish fu
 		return err
 	}
 	if s.mode == "hybrid" {
-		var author int64
-		if err := s.db.QueryRowContext(ctx, "SELECT author_id FROM posts WHERE id=?", payload.PostID).Scan(&author); err != nil {
+		state, err := s.authority.GetPostState(ctx, payload.PostID)
+		if err != nil {
 			return err
 		}
-		if s.pullAuthors[author] {
+		if s.pullAuthors[state.AuthorId] {
 			return nil
 		}
 	}
@@ -119,12 +121,7 @@ func (s *Service) plan(ctx context.Context, event outbox.Event, publish func(con
 }
 
 func (s *Service) preparePage(ctx context.Context, event outbox.Event) ([]int64, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	current, err := loadTask(ctx, tx, event, true)
+	current, err := loadTask(ctx, s.db, event, false)
 	if err != nil {
 		return nil, err
 	}
@@ -133,57 +130,48 @@ func (s *Service) preparePage(ctx context.Context, event outbox.Event) ([]int64,
 	}
 	if current.Children != nil {
 		var children []int64
-		if err := json.Unmarshal(current.Children, &children); err != nil {
-			return nil, err
-		}
-		return children, nil
+		err := json.Unmarshal(current.Children, &children)
+		return children, err
 	}
-	var author int64
-	if err := tx.QueryRowContext(ctx, "SELECT author_id FROM posts WHERE id=?", current.Body.PostID).Scan(&author); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("%w: planning post missing", outbox.ErrPermanent)
-		}
-		return nil, err
+	state, err := s.authority.GetPostState(ctx, current.Body.PostID)
+	if errors.Is(err, post.ErrNotFound) {
+		return nil, fmt.Errorf("%w: planning post missing", outbox.ErrPermanent)
 	}
-	query := "SELECT user_id,id,created_on FROM following WHERE follow_id=?"
-	args := []any{author}
-	if after := current.Body.After; after != nil {
-		if after.ID <= 0 || after.CreatedOn <= 0 {
-			return nil, fmt.Errorf("%w: invalid planning cursor", outbox.ErrPermanent)
-		}
-		query += " AND (created_on<? OR (created_on=? AND id<?))"
-		args = append(args, after.CreatedOn, after.CreatedOn, after.ID)
-	}
-	query += " ORDER BY created_on DESC,id DESC LIMIT ?"
-	args = append(args, planPageSize+1)
-	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	recipients := make([]recipient, 0, planPageSize+1)
-	var boundary Entry
-	hasMore := false
-	for rows.Next() {
-		var target recipient
-		var created int64
-		if err := rows.Scan(&target.UserID, &target.RelationID, &created); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if len(recipients) == planPageSize {
-			hasMore = true
-			break
-		}
-		recipients = append(recipients, target)
-		boundary = Entry{ID: target.RelationID, CreatedOn: created}
+	var after *corepb.FollowerCursor
+	if current.Body.After != nil {
+		after = &corepb.FollowerCursor{CreatedOn: current.Body.After.CreatedOn, RelationId: current.Body.After.ID}
 	}
-	err = rows.Err()
-	rows.Close()
+	page, err := s.authority.ListFollowers(ctx, state.AuthorId, after)
 	if err != nil {
 		return nil, err
+	}
+	recipients := make([]recipient, 0, len(page.Items)+1)
+	for _, item := range page.Items {
+		recipients = append(recipients, recipient{UserID: item.UserId, RelationID: item.RelationId})
 	}
 	if current.Body.After == nil {
-		recipients = append(recipients, recipient{UserID: author})
+		recipients = append(recipients, recipient{UserID: state.AuthorId})
+	}
+	hasMore := page.HasMore
+	boundary := Entry{ID: page.GetNext().GetRelationId(), CreatedOn: page.GetNext().GetCreatedOn()}
+	// RPCs finish before taking the task row lock. Concurrent planners may have
+	// fetched different pages; only the first committed children become durable.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	current, err = loadTask(ctx, tx, event, true)
+	if err != nil {
+		return nil, err
+	}
+	if current.Children != nil {
+		var children []int64
+		err := json.Unmarshal(current.Children, &children)
+		return children, err
 	}
 	children := make([]int64, 0, 7)
 	insert := func(kind string, body taskBody) error {

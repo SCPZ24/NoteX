@@ -8,12 +8,20 @@ import (
 )
 
 func (h *handlers) authenticate(c *gin.Context) {
+	h.authenticateUsing(c, h.accounts)
+}
+
+func (h *handlers) authenticateFeed(c *gin.Context) {
+	h.authenticateUsing(c, h.feedAuth)
+}
+
+func (h *handlers) authenticateUsing(c *gin.Context, auth Authenticator) {
 	parts := strings.Fields(c.GetHeader("Authorization"))
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 		writeError(c, account.ErrUnauthorized)
 		return
 	}
-	user, err := h.accounts.Authenticate(c.Request.Context(), parts[1])
+	user, err := auth.Authenticate(c.Request.Context(), parts[1])
 	if err != nil {
 		writeError(c, err)
 		return

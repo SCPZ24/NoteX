@@ -2,18 +2,16 @@ package feed
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
-	"strings"
 	"sync"
-	"time"
 
+	"github.com/SCPZ24/NoteX/src/internal/account"
 	"github.com/SCPZ24/NoteX/src/internal/cache"
+	"github.com/SCPZ24/NoteX/src/internal/core"
 	"github.com/SCPZ24/NoteX/src/internal/outbox"
 	"github.com/SCPZ24/NoteX/src/internal/post"
 	"github.com/redis/go-redis/v9"
@@ -33,8 +31,10 @@ type Service struct {
 	pullAuthors map[int64]bool
 	policy      string
 	sql         *post.Service
+	authority   core.Reader
 	stats       sync.Map
 	cache       *cache.Store
+	rebuilder   *RebuildClient
 }
 
 // New creates a bounded client without requiring Redis to be online at startup.
@@ -52,28 +52,42 @@ func New(db *sql.DB, redisURL, prefix, mode string, pullAuthors []int64) (*Servi
 			authors[id] = true
 		}
 	}
-	ids := make([]string, 0, len(authors))
-	for id := range authors {
-		ids = append(ids, strconv.FormatInt(id, 10))
-	}
-	sort.Strings(ids)
-	policy := fmt.Sprintf("%x", sha256.Sum256([]byte(mode+":"+strings.Join(ids, ","))))
-	options, err := redis.ParseURL(redisURL)
+	policy := core.IndexPolicy(mode, pullAuthors)
+	store, err := cache.Open(redisURL, prefix)
 	if err != nil {
-		return nil, errors.New("invalid REDIS_URL")
+		return nil, err
 	}
-	options.DialTimeout = 2 * time.Second
-	options.ReadTimeout = 2 * time.Second
-	options.WriteTimeout = 2 * time.Second
-	options.PoolTimeout = 2 * time.Second
-	options.PoolSize = 4
-	options.MaxRetries = -1
-	options.ContextTimeoutEnabled = true
-	r := redis.NewClient(options)
-	store := cache.New(r, prefix)
+	r := store.Redis
+	authority := core.New(db, store)
+	authority.ConfigureIndex(mode, pullAuthors, prefix)
 	sqlPosts := post.New(db, nil)
 	sqlPosts.UseCache(store)
-	return &Service{db: db, redis: r, prefix: prefix, mode: mode, pullAuthors: authors, policy: policy, sql: sqlPosts, cache: store}, nil
+	return &Service{db: db, redis: r, prefix: prefix, mode: mode, pullAuthors: authors, policy: policy, sql: sqlPosts, cache: store, authority: authority}, nil
+}
+
+// NewRemote creates a projection client. Only workers supply a task database.
+// All authoritative business reads use the supplied Core client.
+func NewRemote(taskDB *sql.DB, authority core.Reader, redisURL, prefix, mode string, authors []int64) (*Service, error) {
+	if authority == nil {
+		return nil, errors.New("Core reader is required")
+	}
+	service, err := New(taskDB, redisURL, prefix, mode, authors)
+	if err != nil {
+		return nil, err
+	}
+	service.authority = authority
+	return service, nil
+}
+
+// UseRebuilder routes lazy and relationship-driven rebuilds to a dedicated process.
+func (s *Service) UseRebuilder(client *RebuildClient) { s.rebuilder = client }
+
+// UseCore installs the authoritative read boundary before starting callers.
+func (s *Service) UseCore(reader core.Reader) { s.authority = reader }
+
+// Authenticate lets the Feed HTTP routes use the same Core RPC boundary.
+func (s *Service) Authenticate(ctx context.Context, token string) (account.User, error) {
+	return s.authority.Authenticate(ctx, token)
 }
 
 // Close releases the Redis client after the consumer has stopped.
@@ -96,33 +110,28 @@ func (s *Service) Handle(ctx context.Context, event outbox.Event) error {
 	if err := json.Unmarshal(event.Payload, &payload); err != nil || payload.PostID <= 0 {
 		return fmt.Errorf("%w: invalid post identity", outbox.ErrPermanent)
 	}
-	var entry Entry
-	var author int64
-	if err := s.db.QueryRowContext(ctx, "SELECT author_id FROM posts WHERE id=?", payload.PostID).Scan(&author); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("%w: authoritative post missing", outbox.ErrPermanent)
-		}
-		return err
-	}
-	sources := []cacheSource{{owner: author, author: true, signature: s.policy}}
-	if err := s.touchSources(ctx, sources); err != nil {
-		return err
-	}
-	var deleted sql.NullInt64
-	err := s.db.QueryRowContext(ctx, "SELECT id,author_id,created_on,deleted_on FROM posts WHERE id=?", payload.PostID).
-		Scan(&entry.ID, &author, &entry.CreatedOn, &deleted)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%w: authoritative post %d missing", outbox.ErrPermanent, payload.PostID)
+	state, err := s.authority.GetPostState(ctx, payload.PostID)
+	if errors.Is(err, post.ErrNotFound) {
+		return fmt.Errorf("%w: authoritative post missing", outbox.ErrPermanent)
 	}
 	if err != nil {
 		return err
 	}
-	if deleted.Valid {
-		if err := s.sql.InvalidateBody(ctx, entry.ID); err != nil {
+	sources := []cacheSource{{owner: state.AuthorId, author: true, signature: s.policy}}
+	if err := s.touchSources(ctx, sources); err != nil {
+		return err
+	}
+	// Read again after observing the target generation, preserving the late-write guard.
+	state, err = s.authority.GetPostState(ctx, payload.PostID)
+	if err != nil {
+		return err
+	}
+	if state.Deleted {
+		if err := s.sql.InvalidateBody(ctx, state.PostId); err != nil {
 			return err
 		}
 	}
-	return s.apply(ctx, author, entry, deleted.Valid, sources[0].state.generation)
+	return s.apply(ctx, state.AuthorId, Entry{ID: state.PostId, CreatedOn: state.CreatedOn}, state.Deleted, sources[0].state.generation)
 }
 
 func (s *Service) keys(author int64) []string {

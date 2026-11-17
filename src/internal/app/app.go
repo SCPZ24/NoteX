@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/SCPZ24/NoteX/src/internal/account"
+	"github.com/SCPZ24/NoteX/src/internal/cache"
 	"github.com/SCPZ24/NoteX/src/internal/config"
+	"github.com/SCPZ24/NoteX/src/internal/core"
 	"github.com/SCPZ24/NoteX/src/internal/feed"
 	"github.com/SCPZ24/NoteX/src/internal/follow"
 	"github.com/SCPZ24/NoteX/src/internal/httpapi"
@@ -19,7 +21,28 @@ import (
 	"github.com/SCPZ24/NoteX/src/internal/post"
 )
 
+// Run starts exactly the configured process role. The empty role preserves
+// programmatic callers of the combined-process baseline.
 func Run(ctx context.Context, cfg config.Config) error {
+	switch cfg.Role {
+	case "", "all":
+		return runCombined(ctx, cfg)
+	case "core":
+		return runCore(ctx, cfg)
+	case "feed-query":
+		return runFeedQuery(ctx, cfg)
+	case "feed-worker":
+		return runFeedWorker(ctx, cfg)
+	case "feed-rebuilder":
+		return runRebuilder(ctx, cfg)
+	case "relay":
+		return runRelay(ctx, cfg)
+	default:
+		return fmt.Errorf("unknown process role %q", cfg.Role)
+	}
+}
+
+func runCombined(ctx context.Context, cfg config.Config) error {
 	db, err := mysql.Open(ctx, cfg.MySQLDSN)
 	if err != nil {
 		return err
@@ -30,10 +53,33 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("listen for HTTP: %w", err)
 	}
+	defer listener.Close()
 	router := httpapi.NewRouter(db.PingContext)
 	wake := make(chan struct{}, 1)
 	posts := post.New(db, wake)
-	var reader httpapi.FeedReader = posts
+	var projection *feed.Service
+	var budget *cache.Store
+	if cfg.FeedMode != "sql" && cfg.RedisURL != "" {
+		projection, err = feed.New(db, cfg.RedisURL, cfg.QueuePrefix, cfg.FeedMode, cfg.PullAuthors)
+		if err != nil {
+			return err
+		}
+		defer projection.Close()
+		budget = projection.Cache()
+		posts.UseCache(budget)
+	}
+	authority := core.New(db, budget)
+	authority.ConfigureIndex(cfg.FeedMode, cfg.PullAuthors, cfg.QueuePrefix)
+	rpc, err := core.StartLocal(ctx, authority)
+	if err != nil {
+		return err
+	}
+	defer rpc.Close()
+	var reader httpapi.FeedReader = rpc.Client
+	if projection != nil {
+		projection.UseCore(rpc.Client)
+		reader = projection
+	}
 	if cfg.RabbitMQURL != "" {
 		workerCtx, cancelWorker := context.WithCancel(ctx)
 		workerDone := make(chan struct{})
@@ -41,21 +87,12 @@ func Run(ctx context.Context, cfg config.Config) error {
 			defer close(workerDone)
 			outbox.Run(workerCtx, db, wake, cfg.RabbitMQURL, cfg.QueuePrefix)
 		}()
-		// Stop the worker before closing the shared database pool.
 		defer func() {
 			cancelWorker()
 			<-workerDone
 		}()
 	}
-	if cfg.FeedMode != "sql" && cfg.RedisURL != "" {
-		projection, err := feed.New(db, cfg.RedisURL, cfg.QueuePrefix, cfg.FeedMode, cfg.PullAuthors)
-		if err != nil {
-			listener.Close()
-			return err
-		}
-		defer projection.Close()
-		reader = projection
-		posts.UseCache(projection.Cache())
+	if projection != nil {
 		workerCtx, cancelWorker := context.WithCancel(ctx)
 		workerDone := make(chan struct{})
 		go func() {
@@ -78,27 +115,30 @@ func Run(ctx context.Context, cfg config.Config) error {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	defer server.Close()
 	serveErr := make(chan error, 1)
 	go func() {
 		serveErr <- server.Serve(listener)
 	}()
 	slog.Info("HTTP server listening", "address", listener.Addr().String())
 
+	var failure error
 	select {
 	case err := <-serveErr:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return fmt.Errorf("serve HTTP: %w", err)
+	case err := <-rpc.Done:
+		failure = fmt.Errorf("Core RPC server stopped: %v", err)
 	case <-ctx.Done():
-		// Use a fresh context: ctx has already been canceled by the signal.
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			server.Close()
-			return fmt.Errorf("shutdown HTTP: %w", err)
-		}
-		slog.Info("HTTP server stopped")
-		return nil
 	}
+	// Drain HTTP before stopping its RPC dependency and the shared SQL pool.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		return errors.Join(failure, fmt.Errorf("shutdown HTTP: %w", err))
+	}
+	slog.Info("HTTP server stopped")
+	return failure
 }

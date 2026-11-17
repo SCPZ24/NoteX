@@ -8,28 +8,76 @@ import (
 	"strconv"
 	"strings"
 
+	transport "github.com/SCPZ24/NoteX/src/internal/platform/rpc"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type Config struct {
-	HTTPAddr    string
-	MySQLDSN    string
-	RabbitMQURL string
-	QueuePrefix string
-	RedisURL    string
-	FeedMode    string
-	PullAuthors []int64
+	Role             string
+	CoreRPCAddr      string
+	RebuilderRPCAddr string
+	RPCToken         string
+	MySQLMaxConns    int
+	HTTPAddr         string
+	MySQLDSN         string
+	RabbitMQURL      string
+	QueuePrefix      string
+	RedisURL         string
+	FeedMode         string
+	PullAuthors      []int64
 }
 
 // Load reads environment variables; it does not automatically load a .env file.
 func Load() (Config, error) {
 	cfg := Config{
-		HTTPAddr:    os.Getenv("HTTP_ADDR"),
-		MySQLDSN:    os.Getenv("MYSQL_DSN"),
-		RabbitMQURL: os.Getenv("RABBITMQ_URL"),
-		QueuePrefix: os.Getenv("RABBITMQ_QUEUE_PREFIX"),
-		RedisURL:    os.Getenv("REDIS_URL"),
-		FeedMode:    os.Getenv("FEED_MODE"),
+		Role:             os.Getenv("NOTEX_ROLE"),
+		CoreRPCAddr:      os.Getenv("CORE_RPC_ADDR"),
+		RebuilderRPCAddr: os.Getenv("REBUILDER_RPC_ADDR"),
+		RPCToken:         os.Getenv("RPC_TOKEN"),
+		HTTPAddr:         os.Getenv("HTTP_ADDR"),
+		MySQLDSN:         os.Getenv("MYSQL_DSN"),
+		RabbitMQURL:      os.Getenv("RABBITMQ_URL"),
+		QueuePrefix:      os.Getenv("RABBITMQ_QUEUE_PREFIX"),
+		RedisURL:         os.Getenv("REDIS_URL"),
+		FeedMode:         os.Getenv("FEED_MODE"),
+	}
+	if cfg.Role == "" {
+		cfg.Role = "all"
+	}
+	ports := map[string]string{"all": "8080", "core": "8080", "feed-query": "8081", "feed-worker": "8082", "feed-rebuilder": "8083", "relay": "8084"}
+	portDefault, valid := ports[cfg.Role]
+	if !valid {
+		return Config{}, errors.New("NOTEX_ROLE must be all, core, feed-query, feed-worker, feed-rebuilder, or relay")
+	}
+	if cfg.CoreRPCAddr == "" {
+		cfg.CoreRPCAddr = "127.0.0.1:9090"
+	}
+	if cfg.RebuilderRPCAddr == "" {
+		cfg.RebuilderRPCAddr = "127.0.0.1:9091"
+	}
+	if cfg.Role != "all" && cfg.Role != "relay" {
+		if len(cfg.RPCToken) < 32 {
+			return Config{}, errors.New("RPC_TOKEN requires at least 32 characters for split services")
+		}
+		for _, address := range []string{cfg.CoreRPCAddr, cfg.RebuilderRPCAddr} {
+			if err := transport.ValidateAddress(address); err != nil {
+				return Config{}, err
+			}
+		}
+	}
+	cfg.MySQLMaxConns = 10
+	if cfg.Role == "relay" {
+		cfg.MySQLMaxConns = 2
+	}
+	if cfg.Role == "feed-worker" {
+		cfg.MySQLMaxConns = 4
+	}
+	if value := os.Getenv("MYSQL_MAX_OPEN_CONNS"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 100 {
+			return Config{}, errors.New("MYSQL_MAX_OPEN_CONNS must be between 1 and 100")
+		}
+		cfg.MySQLMaxConns = n
 	}
 	if cfg.FeedMode == "" {
 		cfg.FeedMode = "sql"
@@ -37,7 +85,7 @@ func Load() (Config, error) {
 	if cfg.FeedMode != "sql" && cfg.FeedMode != "push" && cfg.FeedMode != "hybrid" {
 		return Config{}, errors.New("FEED_MODE must be sql, push, or hybrid")
 	}
-	if cfg.FeedMode != "sql" && cfg.RedisURL == "" {
+	if cfg.Role != "relay" && cfg.FeedMode != "sql" && cfg.RedisURL == "" {
 		return Config{}, errors.New("push/hybrid Feed requires REDIS_URL")
 	}
 	if value := strings.TrimSpace(os.Getenv("FEED_PULL_AUTHORS")); value != "" {
@@ -50,7 +98,7 @@ func Load() (Config, error) {
 		}
 	}
 	if cfg.HTTPAddr == "" {
-		cfg.HTTPAddr = "127.0.0.1:8080"
+		cfg.HTTPAddr = "127.0.0.1:" + portDefault
 	}
 	_, port, err := net.SplitHostPort(cfg.HTTPAddr)
 	if err != nil {
@@ -60,7 +108,7 @@ func Load() (Config, error) {
 	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return Config{}, errors.New("HTTP_ADDR port must be between 1 and 65535")
 	}
-	if cfg.MySQLDSN == "" {
+	if cfg.MySQLDSN == "" && (cfg.Role == "all" || cfg.Role == "core" || cfg.Role == "feed-worker" || cfg.Role == "relay") {
 		return Config{}, errors.New("MYSQL_DSN is required")
 	}
 	if cfg.QueuePrefix == "" {
@@ -74,8 +122,16 @@ func Load() (Config, error) {
 			return Config{}, errors.New("RABBITMQ_URL is invalid")
 		}
 	}
-	if cfg.RedisURL != "" && cfg.RabbitMQURL == "" {
+	if cfg.Role == "all" && cfg.RedisURL != "" && cfg.RabbitMQURL == "" {
 		return Config{}, errors.New("REDIS_URL requires RABBITMQ_URL for the Feed consumer")
+	}
+	if cfg.Role == "feed-worker" || cfg.Role == "feed-rebuilder" {
+		if cfg.FeedMode == "sql" {
+			return Config{}, errors.New("Feed workers and rebuilders require push or hybrid mode")
+		}
+	}
+	if (cfg.Role == "feed-worker" || cfg.Role == "relay") && cfg.RabbitMQURL == "" {
+		return Config{}, errors.New("this role requires RABBITMQ_URL")
 	}
 	return cfg, nil
 }

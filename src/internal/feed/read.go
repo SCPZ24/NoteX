@@ -4,12 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -56,9 +54,7 @@ func (s *Service) Feed(ctx context.Context, actor int64, after string, limit int
 		s.renewReader(cacheCtx, actor)
 		return s.sqlPage(ctx, actor, after, limit, "history", true)
 	}
-	var sources []cacheSource
-	var reason string
-	err := s.cache.SQL(ctx, func(query context.Context) error { var e error; sources, reason, e = s.sources(query, actor); return e })
+	sources, reason, err := s.sources(ctx, actor)
 	if err != nil {
 		return post.Page{}, err
 	}
@@ -154,12 +150,7 @@ func (s *Service) renewReader(ctx context.Context, actor int64) {
 }
 func (s *Service) sqlPage(ctx context.Context, actor int64, after string, limit int, reason string, historical bool) (post.Page, error) {
 	s.recordPath("sql_" + reason)
-	var page post.Page
-	err := s.cache.SQL(ctx, func(query context.Context) error {
-		var e error
-		page, e = s.sql.Feed(query, actor, after, limit)
-		return e
-	})
+	page, err := s.authority.ReadFeedPage(ctx, actor, after, limit)
 	if err != nil || !page.HasMore || !historical {
 		return page, err
 	}
@@ -175,41 +166,24 @@ func (s *Service) sqlPage(ctx context.Context, actor int64, after string, limit 
 // The same bounded SQL result selects pull authors and fingerprints exact
 // relationship identities. An unfollow/refollow cannot reuse the old coverage.
 func (s *Service) sources(ctx context.Context, actor int64) ([]cacheSource, string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT f.id,f.follow_id FROM users u LEFT JOIN following f ON f.user_id=u.id WHERE u.id=? ORDER BY f.id LIMIT 4097`, actor)
+	relations, err := s.authority.GetFeedRelations(ctx, actor)
 	if err != nil {
 		return nil, "", err
 	}
-	defer rows.Close()
-	found := false
-	relations := 0
+	if relations.ExceedsLimit {
+		return nil, "relationships", nil
+	}
 	fingerprint := sha256.New()
 	fmt.Fprintf(fingerprint, "%s/%d", s.policy, actor)
 	authors := make(map[int64]bool)
 	if s.pullAuthors[actor] {
 		authors[actor] = true
 	}
-	for rows.Next() {
-		found = true
-		var id, author sql.NullInt64
-		if err := rows.Scan(&id, &author); err != nil {
-			return nil, "", err
+	for _, relation := range relations.Items {
+		fmt.Fprintf(fingerprint, "/%d", relation.ID)
+		if s.pullAuthors[relation.AuthorID] {
+			authors[relation.AuthorID] = true
 		}
-		if id.Valid {
-			relations++
-			fmt.Fprintf(fingerprint, "/%d", id.Int64)
-			if s.pullAuthors[author.Int64] {
-				authors[author.Int64] = true
-			}
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", err
-	}
-	if !found {
-		return nil, "", post.ErrUserNotFound
-	}
-	if relations > 4096 {
-		return nil, "relationships", nil
 	}
 	sources := []cacheSource{{owner: actor, signature: fmt.Sprintf("%x", fingerprint.Sum(nil))}}
 	if len(authors) > maxPullAuthors {
@@ -227,6 +201,9 @@ func (s *Service) sources(ctx context.Context, actor int64) ([]cacheSource, stri
 }
 
 func (s *Service) warmSource(ctx context.Context, source cacheSource) error {
+	if s.rebuilder != nil {
+		return s.rebuilder.ensure(ctx, source, s.policy, s.prefix)
+	}
 	if source.author {
 		return s.ensureAuthor(ctx, source)
 	}
@@ -234,50 +211,17 @@ func (s *Service) warmSource(ctx context.Context, source cacheSource) error {
 }
 
 func (s *Service) warmSnapshot(ctx context.Context, source cacheSource, token string) error {
-	query := `SELECT p.id,p.created_on,0 FROM posts p WHERE p.deleted_on IS NULL AND p.author_id=?`
-	args := []any{source.owner}
-	if !source.author {
-		query = `SELECT p.id,p.created_on,CASE WHEN p.author_id=? THEN 0 ELSE f.id END
- FROM posts p LEFT JOIN following f ON f.user_id=? AND f.follow_id=p.author_id
- WHERE p.deleted_on IS NULL AND (p.author_id=? OR f.id IS NOT NULL)`
-		args = []any{source.owner, source.owner, source.owner}
-		if len(s.pullAuthors) > 0 {
-			ids := make([]int64, 0, len(s.pullAuthors))
-			for id := range s.pullAuthors {
-				ids = append(ids, id)
-			}
-			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-			placeholders := make([]string, len(ids))
-			for i, id := range ids {
-				placeholders[i] = "?"
-				args = append(args, id)
-			}
-			query += " AND p.author_id NOT IN (" + strings.Join(placeholders, ",") + ")"
-		}
+	snapshot, err := s.authority.ReadIndexSnapshot(ctx, source.owner, source.author, s.policy)
+	if err != nil {
+		return err
 	}
-	query += " ORDER BY p.created_on DESC,p.id DESC LIMIT 501"
 	type snapshotEntry struct {
 		entry    Entry
 		relation int64
 	}
-	items := make([]snapshotEntry, 0, retainedPosts+1)
-	err := s.cache.SQL(ctx, func(queryCtx context.Context) error {
-		rows, err := s.db.QueryContext(queryCtx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var item snapshotEntry
-			if err := rows.Scan(&item.entry.ID, &item.entry.CreatedOn, &item.relation); err != nil {
-				return err
-			}
-			items = append(items, item)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return err
+	items := make([]snapshotEntry, 0, len(snapshot.Items))
+	for _, item := range snapshot.Items {
+		items = append(items, snapshotEntry{entry: Entry{ID: item.PostId, CreatedOn: item.CreatedOn}, relation: item.RelationId})
 	}
 	floor := ""
 	if len(items) > retainedPosts {
@@ -398,11 +342,12 @@ func (s *Service) cachedPage(ctx context.Context, actor int64, before *Entry, li
 				ids = append(ids, entry.ID)
 			}
 			var items []post.Post
-			err := s.cache.SQL(ctx, func(query context.Context) error {
-				var e error
-				items, e = s.sql.FeedCandidates(query, actor, ids, limit+1-len(page.Items))
-				return e
-			})
+			var err error
+			if sources[0].author {
+				items, err = s.authority.ResolveAuthorCandidates(ctx, actor, ids, limit+1-len(page.Items))
+			} else {
+				items, err = s.authority.ResolveFeedCandidates(ctx, actor, ids, limit+1-len(page.Items))
+			}
 			if err != nil {
 				return post.Page{}, "", err
 			}

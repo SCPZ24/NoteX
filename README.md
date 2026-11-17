@@ -11,6 +11,68 @@ Sprint 1 已于 2026-11-14 经用户确认完成，交付记录与后续验收�
 
 ## 本地启动
 
+### 分进程运行
+
+`NOTEX_ROLE` 选择当前进程的职责，默认 `all` 沿用下文的单进程启动方式。
+拆分模式使用同一个可执行文件，分别启动五个进程。
+
+| 角色 | 默认 HTTP 地址 | 内部 gRPC 地址 | 直接访问 |
+|---|---|---|---|
+| `core` | `127.0.0.1:8080` | `127.0.0.1:9090` | MySQL 业务表、Outbox 写入、Redis 正文缓存 |
+| `feed-query` | `127.0.0.1:8081` | 客户端 | Redis 候选索引 |
+| `feed-worker` | `127.0.0.1:8082` | 客户端 | MySQL 任务表、Redis、RabbitMQ |
+| `feed-rebuilder` | `127.0.0.1:8083` | `127.0.0.1:9091` | Redis 索引 |
+| `relay` | `127.0.0.1:8084` | — | MySQL Outbox、RabbitMQ |
+
+Core 提供账号、关系、发布、详情和删除接口。Feed Query 提供 `/api/v1/feed` 和
+`/api/v1/users/:id/posts`。其余三个角色的 HTTP 端口提供 `/healthz`、`/readyz`。
+Core 直接维护热点正文缓存及同步删除失效，worker 消费删除事件提供补偿。
+读者和作者索引重建通过 Rebuilder RPC 执行，权威快照由 Core 提供。
+
+先按下文完成数据库迁移，准备 MySQL、Redis 和 RabbitMQ，再编译一次。
+
+```bash
+go build -o /tmp/notex ./src
+```
+
+各终端使用相同的 `FEED_MODE`、`FEED_PULL_AUTHORS`、`RABBITMQ_QUEUE_PREFIX`、Redis 目标、
+`CORE_RPC_ADDR`、`REBUILDER_RPC_ADDR` 和 `RPC_TOKEN`。
+`RPC_TOKEN` 至少 32 个字符，可用 `openssl rand -hex 32` 生成一次并复制到各进程环境。
+RPC 当前使用本机明文连接，监听和连接地址要求为 loopback IP。
+`MYSQL_DSN` 可按角色指定数据库账号，Query 和 Rebuilder 无需该配置。
+
+以下命令分别在五个已设置公共环境变量的终端执行，顺序为 Core、Rebuilder，再启动其余角色。
+`HTTP_ADDR=` 让配置选择各角色默认端口，避免继承旧终端的 8080 配置。
+Rebuilder 和 worker 要求 `FEED_MODE=push|hybrid`。
+
+```bash
+NOTEX_ROLE=core HTTP_ADDR= /tmp/notex
+NOTEX_ROLE=feed-rebuilder HTTP_ADDR= /tmp/notex
+NOTEX_ROLE=feed-query HTTP_ADDR= /tmp/notex
+NOTEX_ROLE=feed-worker HTTP_ADDR= /tmp/notex
+NOTEX_ROLE=relay HTTP_ADDR= /tmp/notex
+```
+
+`CORE_RPC_ADDR` 默认 `127.0.0.1:9090`，`REBUILDER_RPC_ADDR` 默认 `127.0.0.1:9091`。
+Core 客户端启动时检查依赖和推拉策略、队列前缀是否匹配。已启动 Query 在 Redis 或重建服务故障时
+仍可走 Core SQL 回退。初次启动 Query/worker 需要 Core 和 Rebuilder RPC 可连接。
+`FEED_MODE=sql` 的 Query 只需要 Core。
+
+MySQL 默认连接上限分别为 Core 10、worker 4、Relay 2，单实例各一个时合计 16。
+可用每进程的 `MYSQL_MAX_OPEN_CONNS` 覆盖，正式测试前仍需约定全部进程与容器的资源预算。
+正文回源、Feed 权威读取、worker 权威读取与索引快照共同使用 Core 的有界 SQL 准入。
+worker 的任务记录和 Relay 的 Outbox 操作使用各自的连接池。
+
+Relay 通过启动扫描和每 5 秒轮询发现已提交事件，发布到可见的延迟包含该轮询等待。
+Core `/readyz` 检查 MySQL，Query 检查 Core 及部署策略，Rebuilder 检查 Core、策略与 Redis，
+worker 检查任务数据库与 Core，Relay 检查 MySQL。MQ 消费与投递由原有重连循环恢复，
+这些 readiness 检查不代表 MQ 已连接或事件已追平。
+
+这一批提供进程拆分及静态地址连接。固定分片、SAC、etcd 和多实例资源治理属于后续 Sprint 5 批次。
+拆分后的运行正确性及性能需要后续回归确认。
+
+### 单进程运行
+
 需要 Go 1.26.1 或更高版本，以及已有数据库和账号的 MySQL 实例。
 设计目标版本为 MySQL 8.0，本轮实际验证环境为 Homebrew 托管的 MySQL 9.6.0，隔离级别为 REPEATABLE-READ。
 MySQL 8.0 的运行兼容性仍待实际验证。

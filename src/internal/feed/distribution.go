@@ -2,13 +2,12 @@ package feed
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/SCPZ24/NoteX/src/internal/outbox"
+	"github.com/SCPZ24/NoteX/src/internal/post"
 )
 
 func (s *Service) readerKeys(reader int64) []string {
@@ -28,17 +27,15 @@ func (s *Service) distribute(ctx context.Context, event outbox.Event) error {
 	if err := s.readerGenerations(ctx, targets); err != nil {
 		return err
 	}
-	var entry Entry
-	var author int64
-	var deleted sql.NullInt64
-	err = s.db.QueryRowContext(ctx, "SELECT id,author_id,created_on,deleted_on FROM posts WHERE id=?", current.Body.PostID).
-		Scan(&entry.ID, &author, &entry.CreatedOn, &deleted)
-	if errors.Is(err, sql.ErrNoRows) {
+	state, err := s.authority.GetPostState(ctx, current.Body.PostID)
+	if errors.Is(err, post.ErrNotFound) {
 		return fmt.Errorf("%w: distribution post missing", outbox.ErrPermanent)
 	}
 	if err != nil {
 		return err
 	}
+	entry := Entry{ID: state.PostId, CreatedOn: state.CreatedOn}
+	author := state.AuthorId
 	if s.pullAuthors[author] {
 		return nil
 	}
@@ -52,29 +49,18 @@ func (s *Service) distribute(ctx context.Context, event outbox.Event) error {
 	}
 	// Deletion can remove a previously delivered member even after an unfollow.
 	// Active additions check the exact currently existing relationship identity.
-	if !deleted.Valid {
-		args := []any{author}
+	if !state.Deleted {
+		ids := make([]int64, 0, len(targets))
 		for _, target := range targets {
-			args = append(args, target.RelationID)
+			ids = append(ids, target.RelationID)
 		}
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(targets)), ",")
-		rows, err := s.db.QueryContext(ctx, "SELECT id,user_id FROM following WHERE follow_id=? AND id IN ("+placeholders+")", args...)
+		relations, err := s.authority.CheckRelations(ctx, author, ids)
 		if err != nil {
 			return err
 		}
-		active := make(map[int64]int64, len(targets))
-		for rows.Next() {
-			var relation, user int64
-			if err := rows.Scan(&relation, &user); err != nil {
-				rows.Close()
-				return err
-			}
-			active[relation] = user
-		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return err
+		active := make(map[int64]int64, len(relations.Items))
+		for _, relation := range relations.Items {
+			active[relation.RelationId] = relation.UserId
 		}
 		eligible := make([]recipient, 0, len(targets))
 		for _, target := range targets {
@@ -86,7 +72,7 @@ func (s *Service) distribute(ctx context.Context, event outbox.Event) error {
 	}
 	for offset := 0; offset < len(targets); offset += pipelineSize {
 		end := min(offset+pipelineSize, len(targets))
-		if err := s.writeReaderBatch(ctx, entry, targets[offset:end], deleted.Valid); err != nil {
+		if err := s.writeReaderBatch(ctx, entry, targets[offset:end], state.Deleted); err != nil {
 			return err
 		}
 	}

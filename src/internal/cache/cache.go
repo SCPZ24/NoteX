@@ -43,6 +43,23 @@ type Store struct {
 	counters sync.Map
 }
 
+// Open creates the bounded Redis client used by cache-owning processes.
+// The caller closes Store before closing Store.Redis.
+func Open(url, prefix string) (*Store, error) {
+	options, err := redis.ParseURL(url)
+	if err != nil {
+		return nil, errors.New("invalid REDIS_URL")
+	}
+	options.DialTimeout = 2 * time.Second
+	options.ReadTimeout = 2 * time.Second
+	options.WriteTimeout = 2 * time.Second
+	options.PoolTimeout = 2 * time.Second
+	options.PoolSize = 4
+	options.MaxRetries = -1
+	options.ContextTimeoutEnabled = true
+	return New(redis.NewClient(options), prefix), nil
+}
+
 func New(r *redis.Client, prefix string) *Store {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Store{Redis: r, Prefix: prefix, ctx: ctx, cancel: cancel, flights: make(map[string]*flight), callers: make(chan struct{}, 64), sql: make(chan struct{}, 4), queue: make(chan struct{}, 16)}

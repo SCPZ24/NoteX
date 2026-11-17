@@ -8,6 +8,7 @@ import (
 
 	"github.com/SCPZ24/NoteX/src/internal/account"
 	"github.com/SCPZ24/NoteX/src/internal/cache"
+	"github.com/SCPZ24/NoteX/src/internal/core"
 	"github.com/SCPZ24/NoteX/src/internal/follow"
 	"github.com/SCPZ24/NoteX/src/internal/post"
 	"github.com/gin-gonic/gin"
@@ -38,7 +39,7 @@ func writeError(c *gin.Context, err error) {
 		status, code = http.StatusServiceUnavailable, "cache_busy"
 	case errors.Is(err, follow.ErrBusy):
 		status, code = http.StatusServiceUnavailable, "relationship_busy"
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled), errors.Is(err, core.ErrUnavailable):
 		status, code = http.StatusServiceUnavailable, "request_unavailable"
 	default:
 		slog.Error("API operation failed", "route", c.FullPath(), "error", err)

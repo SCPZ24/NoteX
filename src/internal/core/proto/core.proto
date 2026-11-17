@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+// Generate from the repository root with protoc-gen-go v1.36.5 and
+// protoc-gen-go-grpc v1.5.1 on PATH:
+// protoc --go_out=. --go_opt=module=github.com/SCPZ24/NoteX \
+//   --go-grpc_out=. --go-grpc_opt=module=github.com/SCPZ24/NoteX \
+//   src/internal/core/proto/core.proto
+
+package notex.core.v1;
+option go_package = "github.com/SCPZ24/NoteX/src/internal/core/corepb";
+
+// Internal, bounded reads. Authenticate receives the bearer token in metadata.
+service CoreReadService {
+  rpc Authenticate(AuthenticateRequest) returns (User);
+  rpc GetUser(GetUserRequest) returns (User);
+  rpc GetFeedRelations(GetFeedRelationsRequest) returns (GetFeedRelationsResponse);
+  rpc ResolveFeedCandidates(ResolveFeedCandidatesRequest) returns (Posts);
+  rpc ResolveAuthorCandidates(ResolveAuthorCandidatesRequest) returns (Posts);
+  rpc ReadFeedPage(ReadFeedPageRequest) returns (PostPage);
+  rpc ReadAuthorPage(ReadAuthorPageRequest) returns (PostPage);
+  rpc GetPostState(GetPostStateRequest) returns (PostState);
+  rpc ListFollowers(ListFollowersRequest) returns (FollowerPage);
+  rpc CheckRelations(CheckRelationsRequest) returns (FollowerPage);
+  rpc ReadIndexSnapshot(ReadIndexSnapshotRequest) returns (IndexSnapshot);
+  rpc CheckReady(CheckReadyRequest) returns (Deployment);
+}
+
+service FeedRebuildService {
+  rpc EnsureIndex(EnsureIndexRequest) returns (EnsureIndexResponse);
+  rpc CheckReady(CheckReadyRequest) returns (Deployment);
+}
+
+message AuthenticateRequest {}
+message GetUserRequest { int64 user_id = 1; }
+message User {
+  int64 id = 1;
+  string username = 2;
+  int64 created_on = 3;
+}
+// List responses preserve the existing public author shape.
+message Author {
+  int64 id = 1;
+  string username = 2;
+}
+message Post {
+  int64 id = 1;
+  Author author = 2;
+  string content = 3;
+  int64 created_on = 4;
+}
+message Posts { repeated Post items = 1; }
+message PostPage {
+  repeated Post items = 1;
+  string next_cursor = 2;
+  bool has_more = 3;
+}
+message GetFeedRelationsRequest { int64 reader_id = 1; }
+message Relation {
+  int64 relation_id = 1;
+  int64 author_id = 2;
+}
+message GetFeedRelationsResponse {
+  // Ordered by relation_id. Empty when exceeds_limit is true.
+  repeated Relation relations = 1;
+  bool exceeds_limit = 2;
+}
+message ResolveFeedCandidatesRequest {
+  int64 reader_id = 1;
+  // 1..256 IDs before deduplication.
+  repeated int64 post_ids = 2;
+  // 1..101, including the extra item used for pagination.
+  int32 max_results = 3;
+}
+message ResolveAuthorCandidatesRequest {
+  int64 author_id = 1;
+  repeated int64 post_ids = 2;
+  int32 max_results = 3;
+}
+message ReadFeedPageRequest {
+  int64 reader_id = 1;
+  // Existing opaque HTTP cursor, at most 512 bytes.
+  string cursor = 2;
+  // 1..100; defaults are applied by HTTP handlers.
+  int32 page_size = 3;
+}
+message ReadAuthorPageRequest {
+  int64 author_id = 1;
+  string cursor = 2;
+  int32 page_size = 3;
+}
+
+message GetPostStateRequest { int64 post_id = 1; }
+message PostState {
+  int64 post_id = 1;
+  int64 author_id = 2;
+  int64 created_on = 3;
+  bool deleted = 4;
+}
+message FollowerCursor {
+  int64 created_on = 1;
+  int64 relation_id = 2;
+}
+message ListFollowersRequest {
+  int64 author_id = 1;
+  FollowerCursor after = 2;
+}
+message Follower {
+  int64 user_id = 1;
+  int64 relation_id = 2;
+  int64 created_on = 3;
+}
+message FollowerPage {
+  repeated Follower items = 1;
+  FollowerCursor next = 2;
+  bool has_more = 3;
+}
+message CheckRelationsRequest {
+  int64 author_id = 1;
+  repeated int64 relation_ids = 2; // At most 100, zero represents the author.
+}
+message ReadIndexSnapshotRequest {
+  int64 owner_id = 1;
+  bool author_index = 2;
+  string policy_id = 3;
+}
+message SnapshotEntry {
+  int64 post_id = 1;
+  int64 created_on = 2;
+  int64 relation_id = 3;
+}
+message IndexSnapshot {
+  repeated SnapshotEntry items = 1; // At most 501, to determine the coverage floor.
+}
+message CheckReadyRequest {}
+message Deployment {
+  string policy_id = 1;
+  string queue_prefix = 2;
+}
+message EnsureIndexRequest {
+  int64 owner_id = 1;
+  bool author_index = 2;
+  string signature = 3;
+  string generation = 4;
+  string revision = 5;
+  string policy_id = 6;
+  string queue_prefix = 7;
+}
+message EnsureIndexResponse {}

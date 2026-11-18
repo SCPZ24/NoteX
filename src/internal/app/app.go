@@ -24,8 +24,10 @@ import (
 // Run starts exactly the configured process role. The empty role preserves
 // programmatic callers of the combined-process baseline.
 func Run(ctx context.Context, cfg config.Config) error {
+	var metrics *http.ServeMux
 	if cfg.PprofAddr != "" {
-		server, err := startProfiling(cfg.PprofAddr)
+		metrics = http.NewServeMux()
+		server, err := startProfiling(cfg.PprofAddr, metrics)
 		if err != nil {
 			return err
 		}
@@ -41,9 +43,9 @@ func Run(ctx context.Context, cfg config.Config) error {
 	case "", "all":
 		return runCombined(ctx, cfg)
 	case "core":
-		return runCore(ctx, cfg)
+		return runCore(ctx, cfg, metrics)
 	case "feed-query":
-		return runFeedQuery(ctx, cfg)
+		return runFeedQuery(ctx, cfg, metrics)
 	case "feed-worker":
 		return runFeedWorker(ctx, cfg)
 	case "feed-rebuilder":

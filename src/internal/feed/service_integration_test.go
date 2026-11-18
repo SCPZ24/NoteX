@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -230,6 +231,60 @@ func TestAuthorIndexIntegration(t *testing.T) {
 		}
 		return item, event
 	}
+
+	t.Run("zero follows authoritative feed", func(t *testing.T) {
+		read := func(cursor string, limit int, want ...int64) post.Page {
+			t.Helper()
+			page, err := posts.Feed(ctx, 2, cursor, limit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if page.Items == nil || len(page.Items) != len(want) {
+				t.Fatalf("page=%+v, want ids %v", page, want)
+			}
+			for i, id := range want {
+				if page.Items[i].ID != id {
+					t.Fatalf("page=%+v, want ids %v", page, want)
+				}
+			}
+			if page.HasMore != (page.NextCursor != "") {
+				t.Fatalf("inconsistent cursor: %+v", page)
+			}
+			return page
+		}
+		read("", 2)
+		if _, err := posts.Feed(ctx, 99, "", 2); !errors.Is(err, post.ErrUserNotFound) {
+			t.Fatalf("missing reader: %v", err)
+		}
+		execute(t, `INSERT INTO posts(id,author_id,content,created_on,deleted_on) VALUES
+           (1,2,'own',1,NULL),(2,2,'own',2,NULL),(3,2,'own',2,NULL),(4,2,'deleted',3,3),(5,1,'followed',4,NULL)`)
+		defer execute(t, "DELETE FROM posts WHERE id BETWEEN 1 AND 5")
+		page := read("", 2, 3, 2)
+		if !page.HasMore {
+			t.Fatal("missing second page")
+		}
+		if next := read(page.NextCursor, 2, 1); next.HasMore {
+			t.Fatal("unexpected third page")
+		}
+		if _, err := posts.List(ctx, 2, page.NextCursor, 2); !errors.Is(err, post.ErrInvalidCursor) {
+			t.Fatalf("Feed cursor accepted by author list: %v", err)
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err = tx.Exec("INSERT INTO following(user_id,follow_id,created_on) VALUES(2,1,1)"); err != nil {
+			t.Fatal(err)
+		}
+		read("", 4, 3, 2, 1)
+		if err = tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		read("", 4, 5, 3, 2, 1)
+		execute(t, "DELETE FROM following WHERE user_id=2 AND follow_id=1")
+		read("", 4, 3, 2, 1)
+	})
 
 	t.Run("exact int64 ordering same-second pagination duplicates and empty", func(t *testing.T) {
 		entries := []Entry{{ID: 9007199254740993, CreatedOn: 1700000000}, {ID: 9007199254740992, CreatedOn: 1700000000}, {ID: 9223372036854775807, CreatedOn: 1700000001}}

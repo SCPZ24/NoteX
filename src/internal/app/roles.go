@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,12 +27,17 @@ import (
 	"google.golang.org/grpc"
 )
 
-func runCore(ctx context.Context, cfg config.Config) error {
+func runCore(ctx context.Context, cfg config.Config, metrics *http.ServeMux) error {
 	db, err := mysql.OpenWithLimit(ctx, cfg.MySQLDSN, cfg.MySQLMaxConns)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	readDB, err := mysql.OpenWithLimit(ctx, cfg.MySQLDSN, cfg.CoreReadMaxConns)
+	if err != nil {
+		return err
+	}
+	defer readDB.Close()
 	var store *cache.Store
 	if cfg.FeedMode != "sql" || cfg.AdaptiveLikes {
 		store, err = cache.Open(cfg.RedisURL, cfg.QueuePrefix)
@@ -61,7 +67,13 @@ func runCore(ctx context.Context, cfg config.Config) error {
 		}
 		posts.UseAdaptiveLikes(warm)
 	}
-	authority := core.New(db, store)
+	authority := core.NewWithReadPool(db, readDB, store)
+	if metrics != nil {
+		metrics.HandleFunc("GET /debug/pools", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"ordinary": db.Stats(), "read": readDB.Stats(), "cache": store.Stats(), "feed_pages": authority.FeedPageStats()})
+		})
+	}
 	authority.ConfigureIndex(cfg.FeedMode, cfg.PullAuthors, cfg.QueuePrefix)
 	rpc, err := core.Start(cfg.CoreRPCAddr, cfg.RPCToken, authority)
 	if err != nil {
@@ -129,7 +141,7 @@ func connectRebuilder(ctx context.Context, cfg config.Config) (*feed.RebuildClie
 	return client, conn, nil
 }
 
-func runFeedQuery(ctx context.Context, cfg config.Config) error {
+func runFeedQuery(ctx context.Context, cfg config.Config, metrics *http.ServeMux) error {
 	client, conn, err := connectCore(ctx, cfg)
 	if err != nil {
 		return err
@@ -149,6 +161,12 @@ func runFeedQuery(ctx context.Context, cfg config.Config) error {
 		defer projection.Close()
 		projection.UseRebuilder(rebuilder)
 		reader = projection
+		if metrics != nil {
+			metrics.HandleFunc("GET /debug/feed-paths", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(projection.Stats())
+			})
+		}
 	}
 	// Redis/rebuilder failures can still use Core's authoritative SQL pagination.
 	router := httpapi.NewRouter(func(ctx context.Context) error { return deploymentReady(ctx, cfg, client.CheckReady) })

@@ -58,8 +58,9 @@ Core 客户端启动时检查依赖和推拉策略、队列前缀是否匹配。
 仍可走 Core SQL 回退。初次启动 Query/worker 需要 Core 和 Rebuilder RPC 可连接。
 `FEED_MODE=sql` 的 Query 只需要 Core。
 
-MySQL 默认连接上限分别为 Core 10、worker 4、Relay 2，单实例各一个时合计 16。
-可用每进程的 `MYSQL_MAX_OPEN_CONNS` 覆盖，正式测试前仍需约定全部进程与容器的资源预算。
+拆分部署时，Core 的普通 MySQL 池默认 32 条，RPC 权威读取专池默认 4 条。鉴权使用普通池。
+Feed Worker 默认 4 条，Relay 默认 2 条，上述五个角色各一个实例时合计 42 条。启用独立 Like Worker 再加 10 条，六角色合计 52 条。
+每个访问数据库的拆分角色可通过 `MYSQL_MAX_OPEN_CONNS` 调整普通池，Core 可通过 `CORE_READ_MAX_OPEN_CONNS` 调整读专池。单进程模式继续共用一个池。
 正文回源、Feed 权威读取、worker 权威读取与索引快照共同使用 Core 的有界 SQL 准入。
 worker 的任务记录和 Relay 的 Outbox 操作使用各自的连接池。
 

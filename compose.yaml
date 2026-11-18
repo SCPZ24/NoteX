@@ -28,11 +28,11 @@ services:
         max-file: "2"
   redis:
     image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
-    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes", "--appendfsync", "everysec"]
+    command: ["redis-server", "--maxmemory", "1gb", "--maxmemory-policy", "noeviction", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "127.0.0.1:6380:6379"
     cpus: 1
-    mem_limit: 256m
+    mem_limit: 1536m
     volumes:
       - redis_data:/data
     logging:

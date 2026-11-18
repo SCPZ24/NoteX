@@ -79,7 +79,7 @@ func (s *Store) Count(name string) {
 	v.(*atomic.Uint64).Add(1)
 }
 func (s *Store) Stats() map[string]uint64 {
-	result := map[string]uint64{}
+	result := map[string]uint64{"sql_in_use": uint64(len(s.sql)), "sql_queued": uint64(len(s.queue))}
 	s.counters.Range(func(k, v any) bool { result[k.(string)] = v.(*atomic.Uint64).Load(); return true })
 	return result
 }

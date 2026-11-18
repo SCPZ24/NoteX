@@ -13,3 +13,11 @@ stages.md
 
 # 测试数据
 notes/fanout/runs
+
+# 压测结果目录只收录 Markdown 报告，包括分组子目录中的报告
+/notes/performance-tests/**
+!/notes/performance-tests/**/
+!/notes/performance-tests/**/*.md
+
+# 压测脚本运行时生成的 Python 字节码
+/scripts/**/__pycache__/

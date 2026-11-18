@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func startProfiling(address string) (*http.Server, error) {
+func startProfiling(address string, mux *http.ServeMux) (*http.Server, error) {
 	endpoint, err := netip.ParseAddrPort(address)
 	if err != nil || !endpoint.Addr().IsLoopback() {
 		return nil, errors.New("NOTEX_PPROF_ADDR requires a literal loopback IP and port")
@@ -21,7 +21,6 @@ func startProfiling(address string) (*http.Server, error) {
 		return nil, fmt.Errorf("listen for profiling: %w", err)
 	}
 
-	mux := http.NewServeMux()
 	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}

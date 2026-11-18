@@ -7,6 +7,7 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -44,6 +45,10 @@ type Page struct {
 }
 
 type Service struct {
+	selfPages     atomic.Uint64
+	selfPageNanos atomic.Uint64
+	feedPages     atomic.Uint64
+	feedPageNanos atomic.Uint64
 	adaptiveLikes bool
 	warmAuthor    func(context.Context, int64) error
 	db            *sql.DB
@@ -231,8 +236,24 @@ func (s *Service) List(ctx context.Context, owner int64, after string, limit int
 }
 
 func (s *Service) Feed(ctx context.Context, actor int64, after string, limit int) (Page, error) {
-	return s.list(ctx, actor, "feed", after, limit)
+	start := time.Now()
+	page, err := s.list(ctx, actor, "feed", after, limit)
+	s.feedPages.Add(1)
+	s.feedPageNanos.Add(uint64(time.Since(start)))
+	return page, err
 }
+
+// FeedPageStats returns cumulative timings for authoritative Feed pages on this service.
+func (s *Service) FeedPageStats() map[string]uint64 {
+	return map[string]uint64{
+		"calls":      s.feedPages.Load(),
+		"ns":         s.feedPageNanos.Load(),
+		"self_calls": s.selfPages.Load(),
+		"self_ns":    s.selfPageNanos.Load(),
+	}
+}
+
+const postPageOrder = " ORDER BY p.created_on DESC, p.id DESC LIMIT ?"
 
 // Both callers use the same ordering, row format and pagination rules. Kind is
 // selected by these methods; request text never supplies the SQL predicate.
@@ -241,37 +262,48 @@ func (s *Service) list(ctx context.Context, owner int64, kind, after string, lim
 	if owner <= 0 || limit < 1 || limit > 100 {
 		return page, ErrInvalid
 	}
-	query := `SELECT p.id, u.id, u.username, p.content, p.created_on
-		FROM posts p JOIN users u ON u.id = p.author_id
-		WHERE p.deleted_on IS NULL`
-	var args []any
-	if kind == "feed" {
-		// Filter against authoritative relationships before LIMIT. EXISTS keeps a
-		// post as a single row even when it qualifies through more than one source.
-		query += ` AND (p.author_id = ? OR EXISTS (
-			SELECT 1 FROM following f WHERE f.user_id = ? AND f.follow_id = p.author_id))`
-		args = []any{owner, owner}
-	} else {
-		query += " AND p.author_id = ?"
-		args = []any{owner}
-	}
+	var cursorFilter string
+	var cursorArgs []any
 	if after != "" {
 		boundary, err := DecodeCursor(after, owner, kind)
 		if err != nil {
 			return page, err
 		}
-		query += " AND (p.created_on < ? OR (p.created_on = ? AND p.id < ?))"
-		args = append(args, boundary.CreatedOn, boundary.CreatedOn, boundary.ID)
+		cursorFilter = " AND (p.created_on < ? OR (p.created_on = ? AND p.id < ?))"
+		cursorArgs = []any{boundary.CreatedOn, boundary.CreatedOn, boundary.ID}
 	}
-	var exists bool
-	if err := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)", owner).
-		Scan(&exists); err != nil {
-		return page, err
+	query := `SELECT p.id,u.id,u.username,p.content,p.created_on
+        FROM posts p JOIN users u ON u.id=p.author_id WHERE p.deleted_on IS NULL`
+	args := []any{owner}
+	if kind == "feed" {
+		// Check membership and fetch a self-only page within one statement snapshot.
+		// A reader with follows gets one marker row and uses the authoritative query below.
+		started := time.Now()
+		handled, err := s.selfFeedPage(ctx, owner, cursorFilter, cursorArgs, limit+1, &page)
+		if err != nil {
+			return page, err
+		}
+		if handled {
+			result, err := finishPage(page, owner, kind, limit)
+			s.selfPages.Add(1)
+			s.selfPageNanos.Add(uint64(time.Since(started)))
+			return result, err
+		}
+		query += ` AND (p.author_id = ? OR EXISTS (
+            SELECT 1 FROM following f WHERE f.user_id = ? AND f.follow_id = p.author_id))`
+		args = append(args, owner)
+	} else {
+		var exists bool
+		if err := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)", owner).Scan(&exists); err != nil {
+			return page, err
+		}
+		if !exists {
+			return page, ErrUserNotFound
+		}
+		query += " AND p.author_id = ?"
 	}
-	if !exists {
-		return page, ErrUserNotFound
-	}
-	query += " ORDER BY p.created_on DESC, p.id DESC LIMIT ?"
+	query += cursorFilter + postPageOrder
+	args = append(args, cursorArgs...)
 	args = append(args, limit+1)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -288,14 +320,62 @@ func (s *Service) list(ctx context.Context, owner int64, kind, after string, lim
 	if err := rows.Err(); err != nil {
 		return page, err
 	}
+	return finishPage(page, owner, kind, limit)
+}
+
+// selfFeedPage returns handled for every existing reader with no follows, including
+// an empty page. Apply the limit inside the author index scan before the outer join.
+func (s *Service) selfFeedPage(ctx context.Context, owner int64, cursorFilter string, cursorArgs []any, count int, page *Page) (bool, error) {
+	query := `WITH rel AS (SELECT EXISTS(SELECT 1 FROM following WHERE user_id=?) AS has_follows)
+        SELECT u.id,u.username,rel.has_follows,own.id,own.content,own.created_on
+        FROM users u CROSS JOIN rel LEFT JOIN (
+            SELECT p.id,p.content,p.created_on FROM posts p
+            WHERE p.author_id=? AND p.deleted_on IS NULL AND NOT (SELECT has_follows FROM rel)` +
+		cursorFilter + postPageOrder + `
+        ) own ON TRUE WHERE u.id=? ORDER BY own.created_on DESC,own.id DESC`
+	args := append([]any{owner, owner}, cursorArgs...)
+	args = append(args, count, owner)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		found = true
+		var author Author
+		var hasFollows bool
+		var id, created sql.NullInt64
+		var content sql.NullString
+		if err := rows.Scan(&author.ID, &author.Username, &hasFollows, &id, &content, &created); err != nil {
+			return false, err
+		}
+		if hasFollows {
+			return false, nil
+		}
+		if id.Valid {
+			page.Items = append(page.Items, Post{ID: id.Int64, Author: author, Content: content.String, CreatedOn: created.Int64})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if !found {
+		return false, ErrUserNotFound
+	}
+	return true, nil
+}
+
+func finishPage(page Page, owner int64, kind string, limit int) (Page, error) {
 	if len(page.Items) > limit {
 		page.HasMore = true
 		page.Items = page.Items[:limit]
 		last := page.Items[len(page.Items)-1]
-		page.NextCursor, err = EncodeCursor(Cursor{Owner: owner, Kind: kind, CreatedOn: last.CreatedOn, ID: last.ID})
+		cursor, err := EncodeCursor(Cursor{Owner: owner, Kind: kind, CreatedOn: last.CreatedOn, ID: last.ID})
 		if err != nil {
 			return page, err
 		}
+		page.NextCursor = cursor
 	}
 	return page, nil
 }

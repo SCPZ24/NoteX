@@ -24,6 +24,7 @@ type Config struct {
 	RebuilderRPCAddr string
 	RPCToken         string
 	MySQLMaxConns    int
+	CoreReadMaxConns int
 	HTTPAddr         string
 	PprofAddr        string
 	MySQLDSN         string
@@ -88,10 +89,12 @@ func Load() (Config, error) {
 		}
 	}
 	cfg.MySQLMaxConns = 10
-	if cfg.Role == "relay" {
+	switch cfg.Role {
+	case "core":
+		cfg.MySQLMaxConns = 32
+	case "relay":
 		cfg.MySQLMaxConns = 2
-	}
-	if cfg.Role == "feed-worker" {
+	case "feed-worker":
 		cfg.MySQLMaxConns = 4
 	}
 	if value := os.Getenv("MYSQL_MAX_OPEN_CONNS"); value != "" {
@@ -100,6 +103,16 @@ func Load() (Config, error) {
 			return Config{}, errors.New("MYSQL_MAX_OPEN_CONNS must be between 1 and 100")
 		}
 		cfg.MySQLMaxConns = n
+	}
+	if cfg.Role == "core" {
+		cfg.CoreReadMaxConns = 4
+		if value := os.Getenv("CORE_READ_MAX_OPEN_CONNS"); value != "" {
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 1 || n > 100 {
+				return Config{}, errors.New("CORE_READ_MAX_OPEN_CONNS must be between 1 and 100")
+			}
+			cfg.CoreReadMaxConns = n
+		}
 	}
 	if cfg.FeedMode == "" {
 		cfg.FeedMode = "sql"

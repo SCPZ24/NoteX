@@ -52,7 +52,13 @@ type Service struct {
 // New shares the existing cache SQL budget when caching is enabled. The caller
 // owns the database and store. Authentication retains its existing pool budget.
 func New(db *sql.DB, budget *cache.Store) *Service {
-	return &Service{db: db, accounts: account.New(db), posts: post.New(db, nil), budget: budget}
+	return NewWithReadPool(db, db, budget)
+}
+
+// NewWithReadPool routes authoritative and projection reads to readDB.
+// Authentication shares the ordinary pool with Core HTTP traffic.
+func NewWithReadPool(db, readDB *sql.DB, budget *cache.Store) *Service {
+	return &Service{db: readDB, accounts: account.New(db), posts: post.New(readDB, nil), budget: budget}
 }
 
 func (s *Service) query(ctx context.Context, fn func(context.Context) error) error {
@@ -140,6 +146,9 @@ func (s *Service) ResolveAuthorCandidates(ctx context.Context, author int64, ids
 	})
 	return items, err
 }
+
+// FeedPageStats exposes SQL fallback timings for the local profiling listener.
+func (s *Service) FeedPageStats() map[string]uint64 { return s.posts.FeedPageStats() }
 
 func (s *Service) ReadFeedPage(ctx context.Context, reader int64, cursor string, limit int) (post.Page, error) {
 	var page post.Page

@@ -97,6 +97,8 @@ func RegisterCore(router *gin.Engine, accounts *account.Service, follows *follow
 	private.GET("/users/:id/followers", h.listFollowers)
 	private.POST("/posts", h.createPost)
 	private.GET("/posts/:id", h.getPost)
+	private.PUT("/posts/:id/like", h.setLike)
+	private.DELETE("/posts/:id/like", h.setLike)
 	private.DELETE("/posts/:id", h.deletePost)
 }
 

@@ -161,6 +161,7 @@ def main():
         sql((ROOT / "migrations/0004_outbox_events.sql").read_text())
         sql((ROOT / "migrations/0005_event_consumption.sql").read_text())
         sql((ROOT / "migrations/0006_feed_tasks.sql").read_text())
+        sql((ROOT / "migrations/0008_post_likes.sql").read_text())
         sql(f"CREATE USER '{database}'@'127.0.0.1' IDENTIFIED BY '{db_password}';", False)
         account_created = True
         sql(f"GRANT SELECT, INSERT, UPDATE, DELETE ON `{database}`.* TO '{database}'@'127.0.0.1';", False)
@@ -204,15 +205,20 @@ def main():
         check(created["content"] == "中文正文 🐈", "trimmed post content")
         check(created["author"] == {"id": actor, "username": "alice"}, "authenticated post author")
         check(created["id"] > 0 and created["created_on"] > 0, "post identity and timestamp")
-        check(request("GET", post_path + f"/{created['id']}", tokens[1]) == created, "public post detail")
+        detail_path = post_path + f"/{created['id']}"
+        check(request("GET", detail_path, tokens[1]) == dict(created, liked_by_me=False), "public post detail")
+        for method, liked in [("PUT", True), ("PUT", True), ("DELETE", False), ("DELETE", False)]:
+            check(request(method, detail_path + "/like", token) == {"liked_by_me": liked}, "idempotent like")
+            check(request("GET", detail_path, token)["liked_by_me"] == liked, "personal like state")
+            check(not request("GET", detail_path, tokens[1])["liked_by_me"], "like state isolation")
         for content in ["", " \t\n\u3000 ", "x" * 501, "🐈" * 501]:
             request("POST", post_path, token, data={"content": content}, status=400, code="invalid_input")
         request("POST", post_path, token, data={}, status=400, code="invalid_input")
         unicode_post = request("POST", post_path, tokens[1], data={"content": "🐈" * 500}, status=201)
-        check(request("GET", post_path + f"/{unicode_post['id']}", token) == unicode_post,
+        check(request("GET", post_path + f"/{unicode_post['id']}", token) == dict(unicode_post, liked_by_me=False),
               "500 Unicode code points round trip")
         request("DELETE", post_path + f"/{created['id']}", tokens[1], status=403, code="forbidden")
-        check(request("GET", post_path + f"/{created['id']}", token) == created, "forbidden deletion preserves post")
+        check(request("GET", post_path + f"/{created['id']}", token) == dict(created, liked_by_me=False), "forbidden deletion preserves post")
         for method in ["GET", "DELETE"]:
             request(method, post_path + "/999999999", token, status=404, code="post_not_found")
             for value in ["0", "-1", "bad", "9223372036854775808"]:
@@ -478,7 +484,7 @@ def main():
         remaining_after = [p for p in expected_feed(remaining_authors)
                            if (p["created_on"], p["id"]) < (boundary["created_on"], boundary["id"])]
         check(feed_page(feed_cursor)["items"] == remaining_after[:3], "old cursor applies current relationships")
-        check(request("GET", post_path + f"/{fresh_post['id']}", feed_tokens[0]) == fresh_post,
+        check(request("GET", post_path + f"/{fresh_post['id']}", feed_tokens[0]) == dict(fresh_post, liked_by_me=False),
               "unfollow preserves public detail access")
         request("PUT", relation(feed_users[1]["id"]), feed_tokens[0])
         check(collect_feed() == expected_feed(authors), "refollow restores effective history")
@@ -691,7 +697,7 @@ def main():
         check(request("POST", post_path, retry_token, data=retry_content, status=201,
                       request_key="Concurrent-Key") == original_publication, "publication result survives graceful restart")
         check(request("GET", api + "/me", token)["id"] == actor, "session survives restart")
-        check(request("GET", post_path + f"/{new_post['id']}", token) == new_post, "post survives restart")
+        check(request("GET", post_path + f"/{new_post['id']}", token) == dict(new_post, liked_by_me=False), "post survives restart")
         request("GET", deleted_path, token, status=404, code="post_not_found")
         check(collect_feed() == expected_feed(authors), "Feed survives application restart")
         passed("graceful shutdown and session persistence across restart")

@@ -9,6 +9,10 @@ import (
 	"github.com/SCPZ24/NoteX/src/internal/post"
 )
 
+func (s *Service) WarmAuthor(ctx context.Context, id int64) error {
+	return s.ensureAuthor(ctx, cacheSource{owner: id, author: true, signature: s.policy})
+}
+
 func (s *Service) ensureAuthor(ctx context.Context, source cacheSource) error {
 	if s.rebuilder != nil {
 		return s.rebuilder.ensure(ctx, source, s.policy, s.prefix)

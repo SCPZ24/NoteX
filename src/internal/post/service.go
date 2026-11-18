@@ -44,9 +44,16 @@ type Page struct {
 }
 
 type Service struct {
-	db    *sql.DB
-	wake  chan<- struct{}
-	cache *cache.Store
+	adaptiveLikes bool
+	warmAuthor    func(context.Context, int64) error
+	db            *sql.DB
+	wake          chan<- struct{}
+	cache         *cache.Store
+}
+
+func (s *Service) UseAdaptiveLikes(warm func(context.Context, int64) error) {
+	s.adaptiveLikes = true
+	s.warmAuthor = warm
 }
 
 func New(db *sql.DB, wake chan<- struct{}) *Service { return &Service{db: db, wake: wake} }

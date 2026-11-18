@@ -14,6 +14,7 @@ import (
 )
 
 type Config struct {
+	AdaptiveLikes    bool
 	EtcdEndpoints    []string
 	InstanceID       string
 	Version          string
@@ -35,6 +36,7 @@ type Config struct {
 // Load reads environment variables; it does not automatically load a .env file.
 func Load() (Config, error) {
 	cfg := Config{
+		AdaptiveLikes:    os.Getenv("LIKE_MODE") == "adaptive",
 		EtcdEndpoints:    control.Endpoints(os.Getenv("ETCD_ENDPOINTS")),
 		InstanceID:       os.Getenv("INSTANCE_ID"),
 		Version:          os.Getenv("SERVICE_VERSION"),
@@ -52,10 +54,20 @@ func Load() (Config, error) {
 	if cfg.Role == "" {
 		cfg.Role = "all"
 	}
+	if mode := os.Getenv("LIKE_MODE"); mode != "" && mode != "sql" && mode != "adaptive" {
+		return Config{}, errors.New("LIKE_MODE must be sql or adaptive")
+	}
+	if cfg.AdaptiveLikes && (cfg.RedisURL == "" || ((cfg.Role == "relay" || cfg.Role == "all" || cfg.Role == "like-worker") && cfg.RabbitMQURL == "")) {
+		return Config{}, errors.New("adaptive likes require REDIS_URL and RabbitMQ for background roles")
+	}
+	if cfg.Role == "like-worker" && (!cfg.AdaptiveLikes || cfg.MySQLDSN == "") {
+		return Config{}, errors.New("like-worker requires LIKE_MODE=adaptive and MYSQL_DSN")
+	}
 	ports := map[string]string{"all": "8080", "core": "8080", "feed-query": "8081", "feed-worker": "8082", "feed-rebuilder": "8083", "relay": "8084"}
+	ports["like-worker"] = "8086"
 	portDefault, valid := ports[cfg.Role]
 	if !valid {
-		return Config{}, errors.New("NOTEX_ROLE must be all, core, feed-query, feed-worker, feed-rebuilder, or relay")
+		return Config{}, errors.New("unknown NOTEX_ROLE")
 	}
 	if cfg.CoreRPCAddr == "" {
 		cfg.CoreRPCAddr = "127.0.0.1:9090"
@@ -63,7 +75,7 @@ func Load() (Config, error) {
 	if cfg.RebuilderRPCAddr == "" {
 		cfg.RebuilderRPCAddr = "127.0.0.1:9091"
 	}
-	if cfg.Role != "all" && cfg.Role != "relay" {
+	if cfg.Role != "all" && cfg.Role != "relay" && cfg.Role != "like-worker" {
 		if len(cfg.RPCToken) < 32 {
 			return Config{}, errors.New("RPC_TOKEN requires at least 32 characters for split services")
 		}

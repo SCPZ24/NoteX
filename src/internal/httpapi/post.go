@@ -43,12 +43,31 @@ func (h *handlers) getPost(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	item, err := h.posts.Get(c.Request.Context(), id)
+	item, err := h.posts.GetDetail(c.Request.Context(), id, currentUser(c).ID)
 	if err != nil {
 		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, item)
+}
+
+func (h *handlers) setLike(c *gin.Context) {
+	id, err := postID(c)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	liked := c.Request.Method == http.MethodPut
+	async, err := h.posts.SetLike(c.Request.Context(), id, currentUser(c).ID, liked)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	status := http.StatusOK
+	if async {
+		status = http.StatusAccepted
+	}
+	c.JSON(status, gin.H{"liked_by_me": liked})
 }
 
 func (h *handlers) deletePost(c *gin.Context) {

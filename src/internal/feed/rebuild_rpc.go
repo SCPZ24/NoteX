@@ -31,6 +31,10 @@ func (c *RebuildClient) CheckReady(ctx context.Context) (*corepb.Deployment, err
 	return c.rpc.CheckReady(ctx, &corepb.CheckReadyRequest{})
 }
 
+func (c *RebuildClient) WarmAuthor(ctx context.Context, id int64, policy, prefix string) error {
+	return c.ensure(ctx, cacheSource{owner: id, author: true, signature: policy}, policy, prefix)
+}
+
 func (c *RebuildClient) ensure(ctx context.Context, source cacheSource, policy, prefix string) error {
 	_, err := c.rpc.EnsureIndex(ctx, &corepb.EnsureIndexRequest{
 		OwnerId: source.owner, AuthorIndex: source.author, Signature: source.signature,
@@ -83,10 +87,11 @@ func (r *rebuildServer) EnsureIndex(ctx context.Context, req *corepb.EnsureIndex
 	if req.PolicyId != s.policy || req.QueuePrefix != s.prefix {
 		return nil, status.Error(codes.FailedPrecondition, "policy_mismatch")
 	}
-	if req.OwnerId <= 0 || len(req.Signature) != 64 || len(req.Generation) != 32 {
+	authorWarm := req.AuthorIndex && req.Generation == "" && req.Revision == ""
+	if req.OwnerId <= 0 || len(req.Signature) != 64 || (!authorWarm && len(req.Generation) != 32) {
 		return nil, status.Error(codes.InvalidArgument, "invalid_index_identity")
 	}
-	if _, err := strconv.ParseUint(req.Revision, 10, 64); err != nil {
+	if _, err := strconv.ParseUint(req.Revision, 10, 64); !authorWarm && err != nil {
 		return nil, status.Error(codes.InvalidArgument, "invalid_revision")
 	}
 	source := cacheSource{owner: req.OwnerId, author: req.AuthorIndex, signature: req.Signature,

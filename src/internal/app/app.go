@@ -43,6 +43,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 		return runRebuilder(ctx, cfg)
 	case "relay":
 		return runRelay(ctx, cfg)
+	case "like-worker":
+		return runLikeWorker(ctx, cfg)
 	default:
 		return fmt.Errorf("unknown process role %q", cfg.Role)
 	}
@@ -75,6 +77,23 @@ func runCombined(ctx context.Context, cfg config.Config) error {
 		posts.UseCache(budget)
 	}
 	authority := core.New(db, budget)
+	if cfg.AdaptiveLikes {
+		if budget == nil {
+			budget, err = cache.Open(cfg.RedisURL, cfg.QueuePrefix)
+			if err != nil {
+				return err
+			}
+			defer budget.Redis.Close()
+			defer budget.Close()
+			posts.UseCache(budget)
+		}
+		var warm func(context.Context, int64) error
+		if projection != nil {
+			warm = projection.WarmAuthor
+		}
+		posts.UseAdaptiveLikes(warm)
+		defer startLikes(ctx, db, budget, cfg, true, true)()
+	}
 	authority.ConfigureIndex(cfg.FeedMode, cfg.PullAuthors, cfg.QueuePrefix)
 	rpc, err := core.StartLocal(ctx, authority)
 	if err != nil {

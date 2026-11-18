@@ -35,6 +35,8 @@ func writeError(c *gin.Context, err error) {
 		status, code = http.StatusForbidden, "forbidden"
 	case errors.Is(err, post.ErrCacheUnavailable):
 		status, code = http.StatusServiceUnavailable, "cache_invalidation_pending"
+	case errors.Is(err, post.ErrLikeUnavailable):
+		status, code = http.StatusServiceUnavailable, "like_unavailable"
 	case errors.Is(err, cache.ErrBusy):
 		status, code = http.StatusServiceUnavailable, "cache_busy"
 	case errors.Is(err, follow.ErrBusy):

@@ -33,7 +33,7 @@ func runCore(ctx context.Context, cfg config.Config) error {
 	}
 	defer db.Close()
 	var store *cache.Store
-	if cfg.FeedMode != "sql" {
+	if cfg.FeedMode != "sql" || cfg.AdaptiveLikes {
 		store, err = cache.Open(cfg.RedisURL, cfg.QueuePrefix)
 		if err != nil {
 			return err
@@ -46,6 +46,20 @@ func runCore(ctx context.Context, cfg config.Config) error {
 	posts := post.New(db, nil)
 	if store.Redis != nil {
 		posts.UseCache(store)
+	}
+	if cfg.AdaptiveLikes {
+		var warm func(context.Context, int64) error
+		if cfg.FeedMode != "sql" {
+			warm = func(task context.Context, id int64) error {
+				client, conn, err := connectRebuilder(task, cfg)
+				if err != nil {
+					return err
+				}
+				defer conn.Close()
+				return client.WarmAuthor(task, id, core.IndexPolicy(cfg.FeedMode, cfg.PullAuthors), cfg.QueuePrefix)
+			}
+		}
+		posts.UseAdaptiveLikes(warm)
 	}
 	authority := core.New(db, store)
 	authority.ConfigureIndex(cfg.FeedMode, cfg.PullAuthors, cfg.QueuePrefix)
@@ -239,6 +253,15 @@ func runRelay(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	defer db.Close()
+	if cfg.AdaptiveLikes {
+		store, err := cache.Open(cfg.RedisURL, cfg.QueuePrefix)
+		if err != nil {
+			return err
+		}
+		defer store.Redis.Close()
+		defer store.Close()
+		defer startLikes(ctx, db, store, cfg, true, false)()
+	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() {

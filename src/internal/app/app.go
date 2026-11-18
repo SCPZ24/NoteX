@@ -24,6 +24,13 @@ import (
 // Run starts exactly the configured process role. The empty role preserves
 // programmatic callers of the combined-process baseline.
 func Run(ctx context.Context, cfg config.Config) error {
+	if cfg.PprofAddr != "" {
+		server, err := startProfiling(cfg.PprofAddr)
+		if err != nil {
+			return err
+		}
+		defer server.Close()
+	}
 	if len(cfg.EtcdEndpoints) > 0 {
 		if err := openControl(ctx, &cfg); err != nil {
 			return err

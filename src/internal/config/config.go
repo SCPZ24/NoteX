@@ -25,6 +25,7 @@ type Config struct {
 	RPCToken         string
 	MySQLMaxConns    int
 	HTTPAddr         string
+	PprofAddr        string
 	MySQLDSN         string
 	RabbitMQURL      string
 	QueuePrefix      string
@@ -45,6 +46,7 @@ func Load() (Config, error) {
 		RebuilderRPCAddr: os.Getenv("REBUILDER_RPC_ADDR"),
 		RPCToken:         os.Getenv("RPC_TOKEN"),
 		HTTPAddr:         os.Getenv("HTTP_ADDR"),
+		PprofAddr:        os.Getenv("NOTEX_PPROF_ADDR"),
 		MySQLDSN:         os.Getenv("MYSQL_DSN"),
 		RabbitMQURL:      os.Getenv("RABBITMQ_URL"),
 		QueuePrefix:      os.Getenv("RABBITMQ_QUEUE_PREFIX"),

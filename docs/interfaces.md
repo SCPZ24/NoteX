@@ -13,6 +13,10 @@
 通过 revision 观察配置应用进度。`registered` 表示进程最近观察到的注册状态，
 业务依赖健康由 `/readyz` 表达。启动与扩容步骤见 [治理运行说明](operations/distributed.md)。
 
+每个服务实例可通过 `NOTEX_PPROF_ADDR` 启用独立的回环诊断端口，提供
+`GET /debug/pprof/profile` 和 `GET /debug/pprof/trace`。默认关闭。
+采样命令及 SQL 窗口统计见[综合压测方案](operations/综合压测方案.md#已接入的采样入口)。
+
 该文档应随开发进程渐进式更新。
 
 ## 通用约定

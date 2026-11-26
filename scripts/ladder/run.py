@@ -177,12 +177,13 @@ class Resources:
         self.thread.join()
 
 
-def run(args, output, work, report, stack):
+def run(args, output, work, report, stack, *, likes=None):
     namespace = report['namespace']
     source = json.loads(args.fixture.read_text())['database']
     if not re.fullmatch(r'notex_s5_[0-9a-f]+', source):
         raise ValueError('expected an isolated Sprint 5 fixture')
-    report.update(source=source, seed=SEED, roles=ROLES, commit=command('git', 'rev-parse', 'HEAD'))
+    roles = tuple(role for role in ROLES if role != 'like-worker') if likes and likes.mode == 'sql' else ROLES
+    report.update(source=source, seed=SEED, roles=roles, commit=command('git', 'rev-parse', 'HEAD'))
     def cleanup(label, func, *params):
         func(*params)
         report.setdefault('cleaned', []).append(label)
@@ -191,13 +192,16 @@ def run(args, output, work, report, stack):
     monitor.sample()
     env = dict(os.environ, GOMAXPROCS='2', GOMEMLIMIT='128MiB', GIN_MODE='release',
                MYSQL_DSN=f'{namespace}:{namespace}@tcp(127.0.0.1:3306)/{namespace}',
-               FEED_MODE='hybrid', FEED_PULL_AUTHORS='2', LIKE_MODE='adaptive',
+               FEED_MODE='hybrid', FEED_PULL_AUTHORS='2', LIKE_MODE=likes.mode if likes else 'adaptive',
                REDIS_URL='redis://127.0.0.1:6380/15', RABBITMQ_QUEUE_PREFIX=namespace,
                RABBITMQ_URL='amqp://notex:notex-local@127.0.0.1:5673/'+namespace,
                ETCD_ENDPOINTS='http://127.0.0.1:23790', RPC_TOKEN=secrets.token_hex(32),
                CORE_RPC_ADDR='127.0.0.1:19400', REBUILDER_RPC_ADDR='127.0.0.1:19401')
-    for name, package in [('notex', './src'), ('control', './src/cmd/control'), ('load', './scripts/ladder/load.go')]:
-        subprocess.run(['go', 'build', '-p', '2', '-o', work / name, package], cwd=ROOT, env=env, check=True)
+    for name, package in [('notex', './src'), ('control', './src/cmd/control'), ('load', './scripts/ladder/likes' if likes else './scripts/ladder/load.go')]:
+        flags = []
+        if likes and likes.phase == 'replay' and name == 'notex':
+            flags = ['-overlay', str(likes.overlay(work))]
+        subprocess.run(['go', 'build', '-p', '2', *flags, '-o', work / name, package], cwd=ROOT, env=env, check=True)
     report['redis_config'] = {key: redis('CONFIG', 'GET', key).splitlines()[-1]
                               for key in ('maxmemory', 'maxmemory-policy')}
     if report['redis_config'] != {'maxmemory': '1073741824', 'maxmemory-policy': 'noeviction'}:
@@ -239,10 +243,12 @@ def run(args, output, work, report, stack):
                 raise RuntimeError(f'{role} exited with status {proc.returncode}')
 
     ordinary = {'core': args.core_conns, 'feed-worker': 4, 'relay': 2, 'like-worker': 10}
+    if 'like-worker' not in roles:
+        ordinary.pop('like-worker')
     report['mysql_pools'] = dict(ordinary=ordinary, core_read=args.core_read_conns,
                                  total=sum(ordinary.values()) + args.core_read_conns,
                                  server_max=int(sql('SELECT @@max_connections')))
-    for i, role in enumerate(ROLES):
+    for i, role in enumerate(roles):
         port = 18400 + i
         settings = dict(env, INSTANCE_ID='worker-a' if role == 'feed-worker' else role,
                         NOTEX_ROLE=role, HTTP_ADDR=f'127.0.0.1:{port}', NOTEX_PPROF_ADDR=f'127.0.0.1:{18500+i}')
@@ -277,6 +283,9 @@ def run(args, output, work, report, stack):
                        lambda data: write_json(output/'initial-inboxes.json', data))
     report['initial_inboxes'] = dict(ready=len(evidence['ready_ids']), cold=len(evidence['cold_ids']))
     check()
+    if likes:
+        likes.measure(work, output, namespace, check, stack)
+        return
     if args.prepare_only:
         return
 

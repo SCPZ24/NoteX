@@ -1,0 +1,88 @@
+--- src/internal/post/likes.go
++++ src/internal/post/likes.go
+@@ -2,8 +2,10 @@
+ 
+ import (
+ 	"context"
++	"database/sql"
+ 	"errors"
+ 	"fmt"
++	"os"
+ 
+ 	"github.com/SCPZ24/NoteX/src/internal/cache"
+ 	"github.com/redis/go-redis/v9"
+@@ -121,15 +123,24 @@
+ 			return true, nil
+ 		}
+ 	}
++	var result sql.Result
+ 	if liked {
+-		_, err = tx.ExecContext(ctx, "INSERT INTO post_likes(post_id,user_id) VALUES(?,?) ON DUPLICATE KEY UPDATE user_id=post_likes.user_id", id, user)
++		result, err = tx.ExecContext(ctx, "INSERT INTO post_likes(post_id,user_id) VALUES(?,?) ON DUPLICATE KEY UPDATE user_id=post_likes.user_id", id, user)
+ 	} else {
+-		_, err = tx.ExecContext(ctx, "DELETE FROM post_likes WHERE post_id=? AND user_id=?", id, user)
++		result, err = tx.ExecContext(ctx, "DELETE FROM post_likes WHERE post_id=? AND user_id=?", id, user)
+ 	}
+ 	if err != nil {
+ 		return false, err
+ 	}
+-	return false, tx.Commit()
++	rows, err := result.RowsAffected()
++	if err != nil {
++		return false, err
++	}
++	if err = tx.Commit(); err != nil {
++		return false, err
++	}
++	fmt.Fprintln(os.Stderr, "REPLAY_DML", 1, rows)
++	return false, nil
+ }
+ 
+ func (s *Service) buildSegment(ctx context.Context, id, segment int64, key string) error {
+--- src/internal/outbox/likes.go
++++ src/internal/outbox/likes.go
+@@ -7,6 +7,7 @@
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
++	"os"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+@@ -217,6 +218,7 @@
+ 		final[pair{intent.Post, intent.User}] = intent.State
+ 		ms, seq = nextMS, nextSeq
+ 	}
++	var calls, rows int64
+ 	for _, state := range []int{0, 1} {
+ 		var args []any
+ 		for key, value := range final {
+@@ -232,12 +234,23 @@
+ 		if state == 1 {
+ 			query = "INSERT INTO post_likes(post_id,user_id) VALUES " + values + " ON DUPLICATE KEY UPDATE user_id=post_likes.user_id"
+ 		}
+-		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+-			return err
+-		}
++		result, err := tx.ExecContext(ctx, query, args...)
++		if err != nil {
++			return err
++		}
++		affected, err := result.RowsAffected()
++		if err != nil {
++			return err
++		}
++		calls++
++		rows += affected
+ 	}
+ 	if _, err = tx.ExecContext(ctx, "UPDATE like_checkpoints SET stream_ms=?,stream_seq=? WHERE queue_prefix=?", ms, seq, prefix); err != nil {
+ 		return err
+ 	}
+-	return tx.Commit()
+-}
++	if err := tx.Commit(); err != nil {
++		return err
++	}
++	fmt.Fprintln(os.Stderr, "REPLAY_DML", calls, rows)
++	return nil
++}

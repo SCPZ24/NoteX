@@ -21,3 +21,6 @@ notes/fanout/runs
 
 # 压测脚本运行时生成的 Python 字节码
 /scripts/**/__pycache__/
+
+# 本机 DSH 插件（mermaid 图表渲染），不属于项目源码
+.dsh-plugins/
